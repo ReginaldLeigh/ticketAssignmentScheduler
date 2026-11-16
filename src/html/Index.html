@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <?!= include('html/Styles'); ?>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="side">
+        <div class="brand">
+          <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+            <rect x="1" y="1" width="26" height="26" rx="5" fill="#2456a6"/>
+            <rect x="5" y="6" width="8" height="7" rx="1.5" fill="#f2e3b3"/>
+            <rect x="15" y="6" width="8" height="7" rx="1.5" fill="#fff" opacity=".35"/>
+            <rect x="5" y="15" width="8" height="7" rx="1.5" fill="#fff" opacity=".35"/>
+            <rect x="15" y="15" width="8" height="7" rx="1.5" fill="#f2e3b3"/>
+          </svg>
+          <h1>Mailbox rota</h1>
+        </div>
+        <nav class="nav" id="nav" aria-label="Sections"></nav>
+        <div class="who" id="who"></div>
+      </aside>
+      <main id="main" tabindex="-1"><p class="muted">Loading…</p></main>
+    </div>
+    <div id="toasts" role="status" aria-live="polite"></div>
+    <dialog id="dlg"></dialog>
+    <?!= include('html/App'); ?>
+  </body>
+</html>

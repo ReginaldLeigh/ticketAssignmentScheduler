@@ -1,0 +1,753 @@
+<script>
+(function () {
+  'use strict';
+
+  /* ───────────────────────── State & helpers ───────────────────────── */
+  const S = { boot: null, view: 'schedule', weekStart: null, revisions: {}, lastAuditSeen: '', filterEmp: '',
+    emps: {}, mbs: {}, editing: false, running: null };
+  const $main = document.getElementById('main');
+  const $dlg = document.getElementById('dlg');
+
+  function h(tag, attrs) {
+    const el = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach((k) => {
+      const v = attrs[k];
+      if (v === null || v === undefined || v === false) return;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k.indexOf('on') === 0) el.addEventListener(k.slice(2), v);
+      else if (k === 'value') el.value = v;
+      else if (v === true) el.setAttribute(k, '');
+      else el.setAttribute(k, v);
+    });
+    for (let i = 2; i < arguments.length; i++) append(el, arguments[i]);
+    return el;
+  }
+  function append(el, c) {
+    if (c === null || c === undefined || c === false) return;
+    if (Array.isArray(c)) { c.forEach((x) => append(el, x)); return; }
+    el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+  /** Replace an element's children, skipping null/false (native replaceChildren would print "null"). */
+  function fill(el) { el.textContent = ''; for (let i = 1; i < arguments.length; i++) append(el, arguments[i]); return el; }
+  function uuid() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'r' + Date.now() + Math.random().toString(16).slice(2); }
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+  function isAdmin() { return !!(S.boot && S.boot.isAdmin); }
+
+  function call(name, args) {
+    return new Promise((resolve) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((e) => resolve({ ok: false, error: { type: 'NetworkError', message: (e && e.message) || 'The server could not be reached. Check your connection and try again.' } }))[name](args || {});
+    });
+  }
+  /** Calls a server api*; retries automatically while the server is busy saving others' changes. */
+  async function api(name, args, opts) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const res = await call(name, args);
+      if (res && res.ok) return res.data;
+      const err = (res && res.error) || { type: 'Error', message: 'Something went wrong.' };
+      if (err.type === 'BusyError' && !(opts && opts.noRetry) && attempt < 3 && !/run is in progress/i.test(err.message)) {
+        await sleep(500 * Math.pow(2, attempt) + Math.random() * 300);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  function toast(msg, kind) {
+    const t = h('div', { class: 'toast' + (kind === 'bad' ? ' bad' : '') }, msg);
+    document.getElementById('toasts').append(t);
+    setTimeout(() => t.remove(), kind === 'bad' ? 8000 : 5000);
+  }
+  function showError(e) { toast((e && e.message) || String(e), 'bad'); }
+
+  function dialog(title, body, actions) {
+    return new Promise((resolve) => {
+      fill($dlg, h('h3', { text: title }), h('div', null, body),
+        h('div', { class: 'actions' }, actions.map((a) => h('button', { class: 'btn' + (a.primary ? ' primary' : ''),
+          type: 'button', onclick: () => { $dlg.close(); resolve(a.key); } }, a.label))));
+      $dlg.onclose = () => resolve(null);
+      $dlg.showModal();
+    });
+  }
+  async function confirmBox(title, text, okLabel) {
+    return (await dialog(title, h('p', null, text), [{ key: 'no', label: 'Cancel' }, { key: 'yes', label: okLabel, primary: true }])) === 'yes';
+  }
+
+  /** Someone else saved first: show who, and let the user choose (§6.3). */
+  async function onConflict(err, reapply) {
+    const d = err.details || {};
+    const who = d.updatedBy ? String(d.updatedBy).split('@')[0] : 'Someone';
+    const when = d.updatedAt ? fmtDateTime(d.updatedAt) : 'just now';
+    const body = h('div', null, h('p', null, who + ' saved a change to this at ' + when + ', after you opened it. Your change has not been saved.'),
+      d.current ? h('details', null, h('summary', { text: 'See their version' }), h('pre', { class: 'json' }, JSON.stringify(stripMeta(d.current), null, 2))) : null);
+    const actions = [{ key: 'discard', label: 'Discard mine' }];
+    if (reapply) actions.push({ key: 'reapply', label: 'Re-apply my change', primary: true });
+    const choice = await dialog('Someone else changed this first', body, actions);
+    if (choice === 'reapply' && reapply) return reapply(d.current);
+    return null;
+  }
+  function stripMeta(r) { const o = Object.assign({}, r); delete o.id; return o; }
+
+  const DAY = 86400000;
+  function addDays(s, n) { const d = new Date(s + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+  function mondayOf(s) { const d = new Date(s + 'T12:00:00Z'); const wd = (d.getUTCDay() + 6) % 7; return addDays(s, -wd); }
+  function fmtDay(s) { const d = new Date(s + 'T12:00:00Z'); return { wd: d.toLocaleDateString([], { weekday: 'short', timeZone: 'UTC' }), d: d.toLocaleDateString([], { day: 'numeric', timeZone: 'UTC' }) }; }
+  function fmtLong(s) { return new Date(s + 'T12:00:00Z').toLocaleDateString([], { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }); }
+  function fmtDateTime(iso) { if (!iso) return ''; const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
+  void DAY;
+
+  function setRefs(mailboxes, employees) {
+    if (mailboxes) { S.boot.mailboxes = mailboxes; S.mbs = {}; mailboxes.forEach((m) => { S.mbs[m.id] = m; }); }
+    if (employees) { S.boot.employees = employees; S.emps = {}; employees.forEach((e) => { S.emps[e.id] = e; }); }
+  }
+  function empName(id) { return (S.emps[id] && S.emps[id].display_name) || 'Unknown employee'; }
+  function mbName(id) { return (S.mbs[id] && S.mbs[id].name) || (id ? 'Unknown mailbox' : '—'); }
+  function activeMailboxes() { return S.boot.mailboxes.filter((m) => m.active).sort((a, b) => (a.priority || 0) - (b.priority || 0)); }
+  function activeEmployees() { return S.boot.employees.filter((e) => e.active).sort((a, b) => String(a.display_name).localeCompare(b.display_name)); }
+
+  function pageHead(title, sub, right) {
+    return h('div', { class: 'page-head' }, h('div', null, h('h2', { text: title }), sub ? h('p', { class: 'sub', text: sub }) : null),
+      h('div', { class: 'toolbar' }, right));
+  }
+  function savingEl() { return h('span', { class: 'saving', id: 'saving', 'aria-live': 'polite' }); }
+  function setSaving(t) { const el = document.getElementById('saving'); if (el) el.textContent = t; }
+
+  /* ───────────────────────── Shell ───────────────────────── */
+  const VIEWS = [
+    { id: 'schedule', label: 'Weekly schedule', render: viewSchedule },
+    { id: 'mailboxes', label: 'Mailboxes & rules', render: viewMailboxes },
+    { id: 'roster', label: 'Roster', admin: true, render: viewRoster },
+    { id: 'runs', label: 'Run assignment', render: viewRuns },
+    { id: 'log', label: 'Assignment log', admin: true, render: viewLog },
+    { id: 'queue', label: 'Unrouted queue', admin: true, render: viewQueue },
+    { id: 'settings', label: 'Settings', admin: true, render: viewSettings },
+  ];
+
+  function renderNav() {
+    const nav = document.getElementById('nav');
+    fill(nav, ...VIEWS.filter((v) => !v.admin || isAdmin()).map((v) =>
+      h('button', { type: 'button', 'aria-current': S.view === v.id ? 'page' : null, onclick: () => go(v.id) }, v.label)));
+    const who = document.getElementById('who');
+    fill(who, S.running ? h('div', { class: 'running', style: 'margin-bottom:10px' }, 'Run in progress') : '',
+      h('strong', { text: S.boot.user }), isAdmin() ? 'Admin' : 'Viewer');
+  }
+
+  async function go(view) {
+    if (S.editing && view !== S.view && !(await confirmBox('Leave this page?', 'You have changes that are not saved yet.', 'Leave without saving'))) return;
+    S.editing = false;
+    S.view = view;
+    renderNav();
+    await refreshView();
+    $main.focus({ preventScroll: true });
+  }
+
+  async function refreshView(quiet) {
+    const v = VIEWS.find((x) => x.id === S.view);
+    if (!quiet) fill($main, h('p', { class: 'muted', text: 'Loading…' }));
+    try { await v.render(); } catch (e) {
+      fill($main, pageHead(v.label), h('div', { class: 'notice bad' }, e.message || String(e)));
+    }
+  }
+
+  async function boot() {
+    try { S.boot = await api('apiBootstrap'); } catch (e) {
+      fill($main, h('div', { class: 'notice bad' }, h('strong', { text: 'The app could not start. ' }), e.message)); return;
+    }
+    if (S.boot.setupProblems && S.boot.setupProblems.length) {
+      fill(document.getElementById('nav'));
+      fill($main, pageHead('Setup is not finished'), h('div', { class: 'notice bad' },
+        h('p', { text: 'A developer needs to finish setting up the app before it can be used:' }),
+        h('ul', null, S.boot.setupProblems.map((p) => h('li', { text: p })))),
+        h('p', { class: 'muted', style: 'margin-top:12px', text: 'See docs/DEVELOPER_SETUP.md. The app never creates tables or Sheet tabs on its own.' }));
+      return;
+    }
+    setRefs(S.boot.mailboxes, S.boot.employees);
+    S.revisions = S.boot.revisions;
+    S.weekStart = mondayOf(S.boot.today);
+    renderNav();
+    await refreshView();
+    try { S.lastAuditSeen = (await api('apiGetChanges', { since: '' }, { noRetry: true })).latest || ''; } catch (e) { /* not critical */ }
+    setInterval(() => { if (!document.hidden) poll(); }, 30000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  }
+
+  /** Every 30 s while visible: has anyone changed anything? (§6.7) */
+  async function poll() {
+    let p;
+    try { p = await api('apiPoll', {}, { noRetry: true }); } catch (e) { return; }
+    const wasRunning = !!S.running;
+    S.running = p.running;
+    if (wasRunning !== !!p.running) renderNav();
+    const changed = Object.keys(p.revisions).filter((k) => p.revisions[k] !== S.revisions[k]);
+    S.revisions = p.revisions;
+    if (!changed.length) return;
+    try {
+      const c = await api('apiGetChanges', { since: S.lastAuditSeen }, { noRetry: true });
+      S.lastAuditSeen = c.latest || S.lastAuditSeen;
+      c.notes.filter((n) => n.indexOf('You ') !== 0).forEach((n) => toast('Updated: ' + n));
+    } catch (e) { /* ignore */ }
+    if (S.editing) { toast('Someone else changed data on this page. Save or cancel to see the latest.'); return; }
+    refreshView(true);
+  }
+
+  /* ───────────────────────── Weekly schedule ───────────────────────── */
+  async function viewSchedule() {
+    const data = await api('apiGetWeek', { weekStart: S.weekStart });
+    setRefs(data.mailboxes, data.employees);
+    S.revisions = data.revisions;
+    const days = [0, 1, 2, 3, 4, 5, 6].map((i) => addDays(S.weekStart, i));
+    const admin = isAdmin();
+    const byCell = {};
+    data.entries.forEach((e) => { (byCell[e.mailbox_id + '|' + e.date] = byCell[e.mailbox_id + '|' + e.date] || []).push(e); });
+
+    const filter = h('select', { 'aria-label': 'Show one employee', onchange: (ev) => { S.filterEmp = ev.target.value; refreshView(true); } },
+      h('option', { value: '' }, 'Everyone'), activeEmployees().map((e) => h('option', { value: e.id, selected: S.filterEmp === e.id }, e.display_name)));
+    const right = [
+      h('button', { class: 'btn', type: 'button', 'aria-label': 'Previous week', onclick: () => { S.weekStart = addDays(S.weekStart, -7); refreshView(); } }, '‹ Previous'),
+      h('button', { class: 'btn', type: 'button', onclick: () => { S.weekStart = mondayOf(S.boot.today); refreshView(); } }, 'This week'),
+      h('button', { class: 'btn', type: 'button', 'aria-label': 'Next week', onclick: () => { S.weekStart = addDays(S.weekStart, 7); refreshView(); } }, 'Next ›'),
+      filter,
+      admin ? h('button', { class: 'btn', type: 'button', onclick: copyLastWeek }, 'Copy last week') : null,
+      admin ? savingEl() : null,
+    ];
+
+    const mbs = activeMailboxes();
+    const table = h('table', { class: 'board' },
+      h('colgroup', null, h('col', { class: 'mbcol' }), days.map(() => h('col'))),
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Mailbox'), days.map((d) => {
+        const f = fmtDay(d);
+        return h('th', { scope: 'col', class: d === S.boot.today ? 'today' : null }, f.wd, h('span', { class: 'd', text: f.d }));
+      }))),
+      h('tbody', null, mbs.map((mb) => h('tr', null,
+        h('th', { scope: 'row' }, mb.name, mb.description ? h('span', { class: 'desc', text: mb.description }) : null),
+        days.map((d) => cell(mb, d, (byCell[mb.id + '|' + d] || []).sort((a, b) => empName(a.employee_id).localeCompare(empName(b.employee_id))), admin))))));
+
+    let summary = null;
+    if (S.filterEmp) {
+      const mine = data.entries.filter((e) => e.employee_id === S.filterEmp);
+      const parts = mbs.map((mb) => {
+        const ds = mine.filter((e) => e.mailbox_id === mb.id).map((e) => fmtDay(e.date).wd);
+        return ds.length ? mb.name + ' (' + ds.join(', ') + ')' : null;
+      }).filter(Boolean);
+      summary = h('p', { class: 'notice' }, empName(S.filterEmp) + (parts.length ? ' is scheduled on ' + parts.join('; ') + '.' : ' is not scheduled this week.'));
+    }
+
+    fill($main, 
+      pageHead('Weekly schedule', 'Week of ' + fmtLong(S.weekStart), right),
+      summary,
+      mbs.length ? h('div', { class: 'board-wrap' }, table) : h('div', { class: 'panel empty' },
+        admin ? 'Add a mailbox on the Mailboxes & rules page to start building the schedule.' : 'No mailboxes have been set up yet.'),
+      admin && mbs.length ? h('div', { class: 'legend' }, 'Drag a name to move it, or use its ⇄ button. Changes save as you make them.') : null,
+    );
+  }
+
+  function cell(mb, date, entries, admin) {
+    const td = h('td', { class: 'hole' + (date === S.boot.today ? ' today' : '') });
+    const tags = h('div', { class: 'tags' }, entries.map((e) => {
+      const unmapped = admin && S.emps[e.employee_id] && !S.emps[e.employee_id].ivanti_owner_id;
+      const cls = 'tag' + (S.filterEmp ? (e.employee_id === S.filterEmp ? ' hi' : ' dim') : '') + (unmapped ? ' unmapped' : '');
+      const tag = h('div', { class: cls, draggable: admin ? 'true' : null },
+        h('span', { class: 'nm', title: unmapped ? empName(e.employee_id) + ' has no Ivanti owner ID, so they will not receive tickets. Add it on the Roster page.' : null },
+          empName(e.employee_id), unmapped ? h('span', { class: 'flag', text: 'No Ivanti ID' }) : null),
+        admin ? h('span', { class: 'acts' },
+          h('button', { class: 'icon-btn', type: 'button', title: 'Move', 'aria-label': 'Move ' + empName(e.employee_id), onclick: () => moveDialog(e) }, '⇄'),
+          h('button', { class: 'icon-btn', type: 'button', title: 'Remove', 'aria-label': 'Remove ' + empName(e.employee_id) + ' from ' + mb.name, onclick: () => removeEntry(e) }, '×')) : null);
+      if (admin) tag.addEventListener('dragstart', (ev) => { ev.dataTransfer.setData('text/plain', JSON.stringify({ id: e.id, version: e.version })); ev.dataTransfer.effectAllowed = 'move'; });
+      return tag;
+    }));
+    td.append(tags);
+    if (admin) {
+      const slot = h('div', { class: 'add-slot' });
+      const openAdd = () => {
+        const taken = {}; entries.forEach((e) => { taken[e.employee_id] = true; });
+        const options = activeEmployees().filter((e) => !taken[e.id]);
+        if (!options.length) { toast('Everyone is already scheduled on ' + mb.name + ' that day.'); return; }
+        const sel = h('select', { 'aria-label': 'Add someone to ' + mb.name,
+          onchange: (ev) => { if (ev.target.value) addEntry(date, mb.id, ev.target.value); },
+          onblur: () => { setTimeout(() => { if (document.body.contains(sel)) fill(slot, addBtn); }, 150); } },
+          h('option', { value: '' }, 'Add…'), options.map((e) => h('option', { value: e.id }, e.display_name)));
+        fill(slot, sel);
+        sel.focus();
+      };
+      const addBtn = h('button', { class: 'add-btn', type: 'button', 'aria-label': 'Add someone to ' + mb.name + ' on ' + date, onclick: openAdd }, '+ Add');
+      slot.append(addBtn);
+      td.append(slot);
+      td.addEventListener('dragover', (ev) => { ev.preventDefault(); td.classList.add('drop'); });
+      td.addEventListener('dragleave', () => td.classList.remove('drop'));
+      td.addEventListener('drop', (ev) => {
+        ev.preventDefault(); td.classList.remove('drop');
+        let d; try { d = JSON.parse(ev.dataTransfer.getData('text/plain')); } catch (x) { return; }
+        moveEntry(d, date, mb.id);
+      });
+    }
+    return td;
+  }
+
+  async function scheduleOp(name, args, okMsg) {
+    setSaving('Saving…');
+    try {
+      const r = await api(name, Object.assign({ requestId: uuid() }, args));
+      if (r && r.status === 'already_scheduled') toast(r.message || 'Already scheduled there.');
+      else if (r && r.status === 'already_removed') toast('That entry had already been removed.');
+      else if (okMsg) toast(okMsg(r));
+      setSaving('Saved');
+    } catch (e) {
+      setSaving('');
+      if (e.type === 'ConflictError' || e.type === 'NotFoundError') toast('Someone else changed this entry. The board now shows the latest.', 'bad');
+      else showError(e);
+    }
+    await refreshView(true);
+  }
+  function addEntry(date, mailboxId, employeeId) { return scheduleOp('apiScheduleAdd', { date: date, mailboxId: mailboxId, employeeId: employeeId }); }
+  function removeEntry(e) { return scheduleOp('apiScheduleRemove', { id: e.id, version: e.version }); }
+  function moveEntry(e, date, mailboxId) { return scheduleOp('apiScheduleMove', { id: e.id, version: e.version, date: date, mailboxId: mailboxId }); }
+
+  async function moveDialog(e) {
+    const days = [0, 1, 2, 3, 4, 5, 6].map((i) => addDays(S.weekStart, i));
+    const daySel = h('select', null, days.map((d) => h('option', { value: d, selected: d === e.date }, fmtDay(d).wd + ' ' + fmtDay(d).d)));
+    const mbSel = h('select', null, activeMailboxes().map((m) => h('option', { value: m.id, selected: m.id === e.mailbox_id }, m.name)));
+    const choice = await dialog('Move ' + empName(e.employee_id), h('div', { class: 'row' },
+      h('label', { class: 'field' }, 'Day', daySel), h('label', { class: 'field' }, 'Mailbox', mbSel)),
+      [{ key: 'no', label: 'Cancel' }, { key: 'yes', label: 'Move', primary: true }]);
+    if (choice === 'yes') moveEntry(e, daySel.value, mbSel.value);
+  }
+
+  async function copyLastWeek() {
+    const from = addDays(S.weekStart, -7);
+    if (!(await confirmBox('Copy last week', 'Copy everyone scheduled in the week of ' + fmtLong(from) + ' into this week? Entries that already exist are skipped.', 'Copy week'))) return;
+    await scheduleOp('apiScheduleCopyWeek', { fromStart: from, toStart: S.weekStart },
+      (r) => 'Copied ' + r.added + ' ' + (r.added === 1 ? 'entry' : 'entries') + (r.skipped ? '; skipped ' + r.skipped + ' already present.' : '.'));
+  }
+
+  /* ───────────────────────── Mailboxes & rules ───────────────────────── */
+  function describeCond(c) {
+    const op = (S.boot.operators || {})[c.op] || c.op;
+    let v = '';
+    if (c.op === 'between') v = c.value[0] + ' and ' + c.value[1];
+    else if (c.op === 'in') v = (c.value || []).join(', ');
+    else if (c.op !== 'is_empty') v = String(c.value);
+    return [h('code', { text: c.field }), ' ' + op + ' ', v ? h('code', { text: v }) : null];
+  }
+
+  async function viewMailboxes() {
+    const data = await api('apiListRules');
+    setRefs(data.mailboxes, null);
+    const admin = isAdmin();
+    const list = data.mailboxes.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0) || String(a.name).localeCompare(b.name));
+    const container = h('div');
+    const formHost = h('div', { style: 'margin-bottom:12px' });
+    list.forEach((mb, idx) => container.append(mailboxBlock(mb, idx, list.length, data.rules.filter((r) => r.mailbox_id === mb.id && r.active), admin)));
+    fill($main, 
+      pageHead('Mailboxes & rules', 'New tickets are checked against mailboxes from top to bottom. The first rule that matches decides the mailbox; follow-ups always go back to their earlier owner.',
+        admin ? [h('button', { class: 'btn primary', type: 'button', onclick: () => editMailbox(null, formHost) }, 'Add mailbox'), savingEl()] : null),
+      formHost,
+      list.length ? container : h('div', { class: 'panel empty' }, admin ? 'No mailboxes yet. Add the first one to start routing tickets.' : 'No mailboxes have been set up yet.'));
+  }
+
+  function mailboxBlock(mb, idx, total, rules, admin) {
+    const block = h('section', { class: 'mb', 'aria-label': mb.name });
+    const head = h('div', { class: 'mb-head' },
+      h('span', { class: 'mb-pos', title: 'Checked ' + (idx + 1) + ' of ' + total, text: String(idx + 1) }),
+      h('div', { class: 'mb-title' }, h('h3', null, mb.name, mb.active ? null : h('span', { class: 'pill', style: 'margin-left:8px' }, 'Inactive')),
+        mb.description ? h('div', { class: 'muted small', text: mb.description }) : null),
+      admin ? h('div', { class: 'toolbar' },
+        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Check ' + mb.name + ' earlier', disabled: idx === 0, onclick: () => moveMailbox(mb, 'up') }, '↑'),
+        h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Check ' + mb.name + ' later', disabled: idx === total - 1, onclick: () => moveMailbox(mb, 'down') }, '↓'),
+        h('button', { class: 'btn small', type: 'button', onclick: () => editMailbox(mb, block) }, 'Edit')) : null);
+    const body = h('div', { class: 'mb-body' });
+    if (!rules.length) body.append(h('p', { class: 'muted small', text: 'No rules yet. Tickets only reach this mailbox as follow-ups or by hand.' }));
+    rules.forEach((r) => body.append(h('div', { class: 'rule' },
+      h('div', { class: 'cond' }, (r.conditions_json || []).map((c, i) => [i ? h('span', { class: 'muted' }, ' and ') : null, describeCond(c)])),
+      admin ? h('div', { class: 'toolbar' },
+        h('button', { class: 'btn small', type: 'button', onclick: () => ruleBuilder(body, mb, r) }, 'Edit'),
+        h('button', { class: 'btn small danger', type: 'button', onclick: () => removeRule(r) }, 'Remove')) : null)));
+    if (admin && mb.active) body.append(h('button', { class: 'btn small', type: 'button', style: 'margin-top:8px', onclick: () => ruleBuilder(body, mb, null) }, 'Add rule'));
+    block.append(head, body);
+    return block;
+  }
+
+  async function moveMailbox(mb, direction) {
+    setSaving('Saving…');
+    try { await api('apiMoveMailbox', { requestId: uuid(), id: mb.id, direction: direction }); setSaving('Saved'); } catch (e) { setSaving(''); showError(e); }
+    refreshView(true);
+  }
+
+  function editMailbox(mb, host) {
+    S.editing = true;
+    const name = h('input', { type: 'text', value: mb ? mb.name : '', maxlength: '100', required: true });
+    const desc = h('input', { type: 'text', value: mb ? mb.description : '', maxlength: '500' });
+    const active = h('input', { type: 'checkbox', checked: mb ? mb.active : true });
+    const form = h('form', { class: 'builder', onsubmit: async (ev) => {
+      ev.preventDefault();
+      const args = { requestId: uuid(), id: mb ? mb.id : null, version: mb ? mb.version : null, name: name.value, description: desc.value, active: active.checked };
+      const save = async (a) => {
+        try { await api('apiSaveMailbox', a); S.editing = false; toast(mb ? 'Mailbox saved.' : 'Mailbox added.'); refreshView(true); } catch (e) {
+          if (e.type === 'ConflictError') onConflict(e, (cur) => save(Object.assign({}, a, { requestId: uuid(), version: cur.version })));
+          else showError(e);
+        }
+      };
+      save(args);
+    } },
+      h('div', { class: 'row' }, h('label', { class: 'field', style: 'flex:1' }, 'Mailbox name', name), h('label', { class: 'field', style: 'flex:2' }, 'Description (optional)', desc)),
+      mb ? h('label', { class: 'check', style: 'margin-top:10px' }, active, 'Active (inactive mailboxes receive no tickets and are hidden from the schedule)') : null,
+      h('div', { class: 'toolbar', style: 'margin-top:12px' }, h('button', { class: 'btn primary', type: 'submit' }, mb ? 'Save mailbox' : 'Add mailbox'),
+        h('button', { class: 'btn', type: 'button', onclick: () => { S.editing = false; refreshView(true); } }, 'Cancel')));
+    fill(host, form);
+    name.focus();
+  }
+
+  function ruleBuilder(host, mb, rule) {
+    S.editing = true;
+    const conds = rule ? JSON.parse(JSON.stringify(rule.conditions_json || [])) : [{ field: S.boot.ruleFields[0] || '', op: 'equals', value: '' }];
+    const rowsEl = h('div');
+    const result = h('div', { class: 'small', style: 'margin-top:8px' });
+    const fields = S.boot.ruleFields.slice();
+    conds.forEach((c) => { if (c.field && fields.indexOf(c.field) === -1) fields.push(c.field); });
+
+    function drawRows() {
+      fill(rowsEl, ...conds.map((c, i) => {
+        const fieldSel = h('select', { 'aria-label': 'Field', onchange: (ev) => { c.field = ev.target.value; } }, fields.map((f) => h('option', { value: f, selected: f === c.field }, f)));
+        const opSel = h('select', { 'aria-label': 'Operator', onchange: (ev) => { c.op = ev.target.value; c.value = c.op === 'between' ? ['', ''] : ''; drawRows(); } },
+          Object.keys(S.boot.operators).map((o) => h('option', { value: o, selected: o === c.op }, S.boot.operators[o])));
+        let valEl;
+        if (c.op === 'is_empty') valEl = h('span', { class: 'muted small', text: 'No value needed' });
+        else if (c.op === 'between') {
+          const v = Array.isArray(c.value) ? c.value : ['', ''];
+          valEl = h('div', { class: 'pair' }, h('input', { type: 'number', 'aria-label': 'From', value: v[0], oninput: (ev) => { v[0] = ev.target.value; c.value = v; } }), 'and',
+            h('input', { type: 'number', 'aria-label': 'To', value: v[1], oninput: (ev) => { v[1] = ev.target.value; c.value = v; } }));
+        } else {
+          const shown = Array.isArray(c.value) ? c.value.join(', ') : (c.value === null || c.value === undefined ? '' : c.value);
+          valEl = h('input', { type: 'text', 'aria-label': 'Value', value: shown, placeholder: c.op === 'in' ? 'Comma-separated values' : (c.op === 'regex' ? 'Pattern, e.g. ^INV-' : 'Value'),
+            oninput: (ev) => { c.value = ev.target.value; } });
+        }
+        return [i ? h('div', { class: 'and', text: 'and' }) : null, h('div', { class: 'crow' }, fieldSel, opSel, valEl,
+          h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove condition', disabled: conds.length === 1, onclick: () => { conds.splice(i, 1); drawRows(); } }, '×'))];
+      }).flat());
+    }
+    drawRows();
+    const save = async (version) => {
+      try {
+        await api('apiSaveRule', { requestId: uuid(), id: rule ? rule.id : null, version: version, mailboxId: mb.id, conditions: conds, active: true });
+        S.editing = false; toast('Rule saved.'); refreshView(true);
+      } catch (e) {
+        if (e.type === 'ConflictError') onConflict(e, (cur) => save(cur.version)); else showError(e);
+      }
+    };
+    const box = h('div', { class: 'builder' }, h('p', { class: 'small muted', text: 'A ticket goes to ' + mb.name + ' when every condition below matches.' }), rowsEl,
+      h('div', { class: 'toolbar', style: 'margin-top:6px' },
+        h('button', { class: 'btn small', type: 'button', onclick: () => { conds.push({ field: fields[0] || '', op: 'equals', value: '' }); drawRows(); } }, 'Add condition'),
+        h('button', { class: 'btn small', type: 'button', onclick: async () => {
+          result.textContent = 'Testing…';
+          try {
+            const r = await api('apiTestRule', { conditions: conds });
+            fill(result, r.tested ? (r.matchedCount + ' of the last ' + r.tested + ' assigned tickets match.') : 'There are no recently assigned tickets to test against yet.',
+              r.matched.length ? h('ul', null, r.matched.map((m) => h('li', { text: m.ticketId + ': ' + (m.subject || '(no subject)') }))) : null);
+          } catch (e) { result.textContent = e.message; }
+        } }, 'Test against recent tickets')),
+      result,
+      h('div', { class: 'toolbar', style: 'margin-top:12px' },
+        h('button', { class: 'btn primary', type: 'button', onclick: () => save(rule ? rule.version : null) }, 'Save rule'),
+        h('button', { class: 'btn', type: 'button', onclick: () => { S.editing = false; refreshView(true); } }, 'Cancel')));
+    host.append(box);
+  }
+
+  async function removeRule(rule) {
+    if (!(await confirmBox('Remove rule', 'Remove this rule? Tickets will no longer be routed by it.', 'Remove rule'))) return;
+    try { await api('apiRemoveRule', { requestId: uuid(), id: rule.id, version: rule.version }); toast('Rule removed.'); } catch (e) {
+      if (e.type === 'ConflictError') toast('Someone else changed this rule. The page now shows the latest.', 'bad'); else showError(e);
+    }
+    refreshView(true);
+  }
+
+  /* ───────────────────────── Roster ───────────────────────── */
+  async function viewRoster() {
+    const boot = await api('apiBootstrap');
+    S.boot = Object.assign(S.boot, { mailboxes: boot.mailboxes, employees: boot.employees });
+    setRefs(boot.mailboxes, boot.employees);
+    const list = boot.employees.slice().sort((a, b) => (b.active - a.active) || String(a.display_name).localeCompare(b.display_name));
+    const tbody = h('tbody');
+    list.forEach((e) => tbody.append(empRow(e, tbody)));
+    const formHost = h('div');
+    fill($main, 
+      pageHead('Roster', 'People who can be scheduled. Each person needs their Ivanti owner ID before they can receive tickets.',
+        [h('button', { class: 'btn primary', type: 'button', onclick: () => empForm(null, formHost) }, 'Add employee')]),
+      formHost,
+      list.length ? h('div', { class: 'panel table-scroll' }, h('table', { class: 'data' },
+        h('thead', null, h('tr', null, ['Name', 'Email', 'Ivanti owner ID', 'Status', ''].map((t) => h('th', { scope: 'col', text: t })))), tbody))
+        : h('div', { class: 'panel empty', text: 'No employees yet. Add the people who work the mailboxes.' }));
+  }
+  function empRow(e, tbody) {
+    const tr = h('tr', { class: e.active ? null : 'inactive' },
+      h('td', { text: e.display_name }), h('td', { text: e.employee_email }),
+      h('td', null, e.ivanti_owner_id || h('span', { class: 'pill bad', text: 'Missing' })),
+      h('td', null, h('span', { class: 'pill' + (e.active ? ' ok' : ''), text: e.active ? 'Active' : 'Inactive' })),
+      h('td', null, h('button', { class: 'btn small', type: 'button', onclick: () => {
+        const host = h('td', { colspan: '5' }); const row = h('tr', null, host); tr.replaceWith(row); empForm(e, host);
+      } }, 'Edit')));
+    void tbody;
+    return tr;
+  }
+  function empForm(e, host) {
+    S.editing = true;
+    const name = h('input', { type: 'text', value: e ? e.display_name : '', required: true, maxlength: '100' });
+    const email = h('input', { type: 'email', value: e ? e.employee_email : '', required: true, maxlength: '200' });
+    const owner = h('input', { type: 'text', value: e ? e.ivanti_owner_id : '', maxlength: '200' });
+    const active = h('input', { type: 'checkbox', checked: e ? e.active : true });
+    const save = async (version) => {
+      try {
+        await api('apiSaveEmployee', { requestId: uuid(), id: e ? e.id : null, version: version, display_name: name.value, employee_email: email.value, ivanti_owner_id: owner.value, active: active.checked });
+        S.editing = false; toast(e ? 'Employee saved.' : 'Employee added.'); refreshView(true);
+      } catch (err) { if (err.type === 'ConflictError') onConflict(err, (cur) => save(cur.version)); else showError(err); }
+    };
+    fill(host, h('form', { class: 'builder', onsubmit: (ev) => { ev.preventDefault(); save(e ? e.version : null); } },
+      h('div', { class: 'row' }, h('label', { class: 'field' }, 'Name', name), h('label', { class: 'field' }, 'Email', email), h('label', { class: 'field' }, 'Ivanti owner ID', owner)),
+      e ? h('label', { class: 'check', style: 'margin-top:10px' }, active, 'Active (inactive employees cannot be scheduled; their follow-ups go through the normal split)') : null,
+      h('div', { class: 'toolbar', style: 'margin-top:12px' }, h('button', { class: 'btn primary', type: 'submit' }, e ? 'Save employee' : 'Add employee'),
+        h('button', { class: 'btn', type: 'button', onclick: () => { S.editing = false; refreshView(true); } }, 'Cancel'))));
+    name.focus();
+  }
+
+  /* ───────────────────────── Run assignment ───────────────────────── */
+  const STATUS_TEXT = { succeeded: 'Finished', failed: 'Failed', stopped_check_failed: 'Stopped: setup incomplete', running: 'Running', continued: 'Continued in a follow-up run' };
+  function statusPill(s) {
+    const cls = s === 'succeeded' ? 'ok' : (s === 'failed' || s === 'stopped_check_failed') ? 'bad' : 'info';
+    return h('span', { class: 'pill ' + cls, text: STATUS_TEXT[s] || s });
+  }
+
+  async function viewRuns() {
+    const st = await api('apiRunStatus');
+    S.running = st.lease ? { startedBy: st.lease.startedBy, startedAt: st.lease.startedAt } : null;
+    renderNav();
+    const admin = isAdmin();
+    const dry = h('input', { type: 'checkbox' });
+    const btn = h('button', { class: 'btn primary', type: 'button', disabled: !!st.lease, onclick: () => runNow(btn, dry.checked) }, 'Run now');
+    const hm = (t) => { const [H, M] = t.split(':').map(Number); return ((H % 12) || 12) + ':' + String(M).padStart(2, '0') + (H < 12 ? ' AM' : ' PM'); };
+    const sched = st.schedule ? ('Automatic runs: ' + st.schedule.times.split(',').map(hm).join(' and ') + ' on ' + st.schedule.days.split(',').map((d) => d.charAt(0) + d.slice(1).toLowerCase()).join(', ') + '.') : '';
+    const parts = [pageHead('Run assignment', sched + ' Anyone can start a run now.', [admin ? h('label', { class: 'check' }, dry, 'Dry run (no changes in Ivanti)') : null, btn])];
+    if (st.lease) parts.push(h('div', { class: 'notice' }, 'A run is in progress. It was started by ' + st.lease.startedBy + ' at ' + fmtDateTime(st.lease.startedAt) + '.'));
+    if (st.lastSummary) parts.push(summaryPanel(st.lastSummary));
+    if (admin) parts.push(setupPanel(st.lastCheck));
+    parts.push(h('div', { class: 'panel' }, h('h3', { text: 'Recent runs' }), st.runsError ? h('p', { class: 'muted', text: st.runsError }) :
+      !st.recentRuns.length ? h('p', { class: 'muted', text: 'No runs yet.' }) :
+      h('div', { class: 'table-scroll' }, h('table', { class: 'data' }, h('thead', null, h('tr', null,
+        ['Started', 'Type', 'Started by', 'Result', 'Fetched', 'Assigned', 'Follow-ups', 'Unrouted', 'Ivanti update failures'].map((t) => h('th', { scope: 'col', text: t })))),
+        h('tbody', null, st.recentRuns.map((r) => h('tr', null, h('td', { text: fmtDateTime(r.started_at) }),
+          h('td', { text: (r.trigger_type === 'scheduled' ? 'Scheduled' : r.trigger_type === 'manual' ? 'Run now' : 'Continuation') + (r.dry_run ? ' (dry run)' : '') }),
+          h('td', { text: String(r.triggered_by).split('@')[0] }), h('td', null, statusPill(r.status)),
+          h('td', { text: r.fetched }), h('td', { text: r.assigned }), h('td', { text: r.follow_ups }), h('td', { text: r.unrouted }), h('td', { text: r.writeback_failures }))))))));
+    fill($main, h('div', { class: 'stack' }, parts));
+  }
+
+  function summaryPanel(s) {
+    const line = s.status === 'busy' || s.status === 'cooldown' ? null :
+      h('p', null, 'Fetched ' + (s.fetched || 0) + ' tickets; assigned ' + (s.assigned || 0) + ' (' + (s.followUps || 0) + ' follow-ups); ' +
+        (s.unrouted || 0) + ' left in the Unrouted queue; ' + (s.writebackFailures || 0) + ' Ivanti updates to retry.');
+    return h('div', { class: 'panel' }, h('h3', null, 'Last run ', statusPill(s.status), s.dryRun ? h('span', { class: 'pill', style: 'margin-left:6px', text: 'Dry run' }) : null),
+      h('p', { class: 'muted small', text: fmtDateTime(s.finishedAt || s.startedAt) }), line,
+      s.errors && s.errors.length ? h('div', { class: 'notice bad' }, h('ul', null, s.errors.map((e) => h('li', { text: e })))) : null);
+  }
+
+  function setupPanel(last) {
+    const out = h('div');
+    const draw = (res) => {
+      if (!res) { fill(out, h('p', { class: 'muted', text: 'Not checked yet.' })); return; }
+      const c = res.check || res;
+      const all = [].concat(c.config || [], c.sheets || [], c.bigQuery || []);
+      fill(out, all.length ? h('div', { class: 'notice bad' }, h('p', { text: 'A developer still needs to finish these. The app never creates tables itself.' }),
+        h('ul', null, all.map((p) => h('li', { text: p })))) : h('div', { class: 'notice good', text: 'Everything is set up. Last checked ' + fmtDateTime(c.checkedAt) + '.' }),
+        res.triggers ? h('p', { class: 'small', style: 'margin-top:10px' }, res.triggers.tickerInstalled ? 'Automatic runs are switched on.' : 'Automatic runs are not switched on yet. ',
+          res.triggers.tickerInstalled ? null : h('button', { class: 'btn small', type: 'button', onclick: async () => {
+            try { await api('apiInstallSchedule'); toast('Automatic runs switched on.'); viewRuns(); } catch (e) { showError(e); } } }, 'Switch on automatic runs')) : null);
+    };
+    draw(last);
+    return h('div', { class: 'panel' }, h('div', { class: 'page-head', style: 'margin-bottom:8px' }, h('h3', { text: 'Setup check' }),
+      h('button', { class: 'btn small', type: 'button', onclick: async () => {
+        fill(out, h('p', { class: 'muted', text: 'Checking…' }));
+        try { draw(await api('apiCheckSetup')); } catch (e) { fill(out, h('div', { class: 'notice bad', text: e.message })); } } }, 'Check setup')), out);
+  }
+
+  async function runNow(btn, dryRun) {
+    btn.disabled = true; btn.textContent = 'Running…';
+    try {
+      const r = await api('apiRunNow', { dryRun: dryRun }, { noRetry: true });
+      if (r.status === 'busy') toast('A run is already in progress (started by ' + r.current.startedBy + ').');
+      else if (r.status === 'cooldown') toast('A run just finished. You can start another in ' + r.minutesLeft + ' minute' + (r.minutesLeft === 1 ? '' : 's') + '.');
+      else if (r.status === 'succeeded') toast('Run finished: ' + r.assigned + ' assigned, ' + r.unrouted + ' unrouted.');
+      else if (r.status === 'stopped_check_failed') toast('The run stopped because setup is incomplete. See the setup check below.', 'bad');
+      else if (r.status === 'failed') toast('The run failed: ' + (r.errors[0] || 'unknown error'), 'bad');
+    } catch (e) { showError(e); }
+    viewRuns();
+  }
+
+  /* ───────────────────────── Assignment log ───────────────────────── */
+  const METHOD = { rule: 'Rule', follow_up: 'Follow-up', vertex: 'Vertex', manual: 'By hand', backfill: 'History' };
+  async function viewLog(filters) {
+    const f = filters || S.logFilters || { from: addDays(S.boot.today, -7), to: S.boot.today, ticketId: '', employeeId: '', mailboxId: '', includeDryRun: false };
+    S.logFilters = f;
+    const res = await api('apiSearchAssignments', f);
+    const boot = S.boot;
+    const fFrom = h('input', { type: 'date', value: f.from }), fTo = h('input', { type: 'date', value: f.to });
+    const fTicket = h('input', { type: 'text', value: f.ticketId, placeholder: 'Ticket number' });
+    const fEmp = h('select', null, h('option', { value: '' }, 'Anyone'), boot.employees.map((e) => h('option', { value: e.id, selected: e.id === f.employeeId }, e.display_name)));
+    const fMb = h('select', null, h('option', { value: '' }, 'Any mailbox'), boot.mailboxes.map((m) => h('option', { value: m.id, selected: m.id === f.mailboxId }, m.name)));
+    const fDry = h('input', { type: 'checkbox', checked: f.includeDryRun });
+    const form = h('form', { class: 'panel row', onsubmit: (ev) => { ev.preventDefault();
+      refreshLog({ from: fFrom.value, to: fTo.value, ticketId: fTicket.value.trim(), employeeId: fEmp.value, mailboxId: fMb.value, includeDryRun: fDry.checked }); } },
+      h('label', { class: 'field' }, 'From', fFrom), h('label', { class: 'field' }, 'To', fTo), h('label', { class: 'field' }, 'Ticket', fTicket),
+      h('label', { class: 'field' }, 'Employee', fEmp), h('label', { class: 'field' }, 'Mailbox', fMb),
+      h('label', { class: 'check' }, fDry, 'Include dry runs'), h('button', { class: 'btn primary', type: 'submit' }, 'Search'));
+
+    const per = Object.keys(res.perEmployee).map((id) => ({ id: id, n: res.perEmployee[id] })).sort((a, b) => empName(a.id).localeCompare(empName(b.id)));
+    const perPanel = per.length ? h('div', { class: 'panel' }, h('h3', { text: 'Tickets per person in this range' }),
+      h('table', { class: 'data' }, h('thead', null, h('tr', null, ['Employee', 'New tickets (count toward the split)', 'Follow-ups'].map((t) => h('th', { scope: 'col', text: t })))),
+        h('tbody', null, per.map((p) => h('tr', null, h('td', { text: empName(p.id) }), h('td', { text: p.n.balanced }), h('td', { text: p.n.followUps })))))) : null;
+
+    const rows = res.rows.map((r) => h('tr', null,
+      h('td', null, h('strong', { text: r.ticket_id }), r.dry_run ? h('div', null, h('span', { class: 'pill', text: 'Dry run' })) : null),
+      h('td', { text: r.subject || '' }), h('td', { text: mbName(r.mailbox_id) }), h('td', { text: empName(r.employee_id) }),
+      h('td', null, h('span', { class: 'pill' + (r.routing_method === 'follow_up' ? ' follow' : ''), text: METHOD[r.routing_method] || r.routing_method }),
+        r.routing_method === 'follow_up' && r.matched_ticket_id ? h('div', { class: 'small muted', text: 'matches ' + r.matched_ticket_id + ' (' + Math.round((r.match_score || 0) * 100) + '%)' }) : null),
+      h('td', { text: fmtDateTime(r.assigned_at) + (r.assigned_by && r.assigned_by !== 'system' ? ' by ' + String(r.assigned_by).split('@')[0] : '') }),
+      h('td', null, h('span', { class: 'pill ' + (r.writeback_status === 'success' ? 'ok' : r.writeback_status === 'failed' ? 'bad' : ''),
+        title: r.writeback_error || '', text: { success: 'Updated', failed: 'Failed', pending: 'Pending', skipped_dry_run: 'Not sent', not_applicable: '—' }[r.writeback_status] || r.writeback_status })),
+      h('td', null, r.dry_run || r.routing_method === 'backfill' ? null : h('div', { class: 'toolbar' },
+        h('button', { class: 'btn small', type: 'button', onclick: () => reassign(r) }, 'Reassign'),
+        r.writeback_status !== 'success' ? h('button', { class: 'btn small', type: 'button', onclick: () => retryWb(r) }, 'Retry update') : null))));
+
+    fill($main, h('div', { class: 'stack' },
+      pageHead('Assignment log', 'Every ticket the app assigned, how it was routed, and whether its owner was updated in Ivanti.'),
+      form, perPanel,
+      h('div', { class: 'panel table-scroll' }, rows.length ? h('table', { class: 'data' }, h('thead', null, h('tr', null,
+        ['Ticket', 'Subject', 'Mailbox', 'Assigned to', 'How', 'When', 'Ivanti', ''].map((t) => h('th', { scope: 'col', text: t })))), h('tbody', null, rows))
+        : h('p', { class: 'empty', text: 'No assignments match these filters.' }))));
+  }
+  function refreshLog(f) { S.logFilters = f; refreshView(); }
+
+  async function reassign(r) {
+    const sel = h('select', null, activeEmployees().filter((e) => e.ivanti_owner_id).map((e) => h('option', { value: e.id, selected: e.id === r.employee_id }, e.display_name)));
+    const choice = await dialog('Reassign ' + r.ticket_id, h('div', null, h('p', { text: 'The new owner is also set in Ivanti. Later follow-ups go to the new owner.' }),
+      h('label', { class: 'field' }, 'Assign to', sel)), [{ key: 'no', label: 'Cancel' }, { key: 'yes', label: 'Reassign', primary: true }]);
+    if (choice !== 'yes' || sel.value === r.employee_id) return;
+    try {
+      const res = await api('apiReassign', { ticketId: r.ticket_id, employeeId: sel.value, version: r.version });
+      toast(res.writeback.status === 'success' ? 'Reassigned and updated in Ivanti.' : 'Reassigned. The Ivanti update failed and will be retried.', res.writeback.status === 'success' ? null : 'bad');
+    } catch (e) { if (e.type === 'ConflictError') toast('Someone else changed this ticket. The log now shows the latest.', 'bad'); else showError(e); }
+    refreshView(true);
+  }
+  async function retryWb(r) {
+    try { const res = await api('apiRetryWriteback', { ticketId: r.ticket_id }); toast(res.status === 'success' ? 'Updated in Ivanti.' : 'The Ivanti update failed again: ' + (res.error || ''), res.status === 'success' ? null : 'bad'); } catch (e) { showError(e); }
+    refreshView(true);
+  }
+
+  /* ───────────────────────── Unrouted queue ───────────────────────── */
+  const REASON = { no_rule_match: 'No rule matched', no_one_scheduled: 'No one scheduled on its mailbox' };
+  const QSTATUS = { pending: 'Waiting', no_one_scheduled: 'Waiting for schedule', failed: 'Vertex error', manual_review: 'Needs review', classified: 'Classified' };
+  async function viewQueue() {
+    const items = await api('apiListQueue');
+    const rows = items.map((q) => {
+      const mbSel = h('select', { 'aria-label': 'Mailbox for ' + q.ticket_id }, h('option', { value: '' }, 'Choose mailbox…'),
+        activeMailboxes().map((m) => h('option', { value: m.id, selected: m.id === q.result_mailbox_id }, m.name)));
+      const empSel = h('select', { 'aria-label': 'Employee for ' + q.ticket_id }, h('option', { value: '' }, 'Fewest tickets today'),
+        activeEmployees().filter((e) => e.ivanti_owner_id).map((e) => h('option', { value: e.id }, e.display_name)));
+      return h('tr', null, h('td', null, h('strong', { text: q.ticket_id })), h('td', { text: q.subject }), h('td', { text: q.category }),
+        h('td', { text: REASON[q.reason] || q.reason || '' }),
+        h('td', null, h('span', { class: 'pill', text: QSTATUS[q.status] || q.status }), q.confidence ? h('div', { class: 'small muted', text: 'Vertex ' + Math.round(q.confidence * 100) + '%: ' + (q.rationale || '') }) : null),
+        h('td', { text: fmtDateTime(q.created_at) }),
+        h('td', null, h('div', { class: 'toolbar' }, mbSel, empSel, h('button', { class: 'btn small primary', type: 'button', onclick: async () => {
+          if (!mbSel.value) { toast('Choose a mailbox first.'); return; }
+          try {
+            const r = await api('apiResolveQueue', { ticketId: q.ticket_id, mailboxId: mbSel.value, employeeId: empSel.value || null, version: q.version });
+            toast('Assigned to ' + empName(r.employeeId) + (r.writeback.status === 'success' ? '.' : '. The Ivanti update failed and will be retried.'));
+          } catch (e) { if (e.type === 'ConflictError') toast('Someone else already handled this ticket.', 'bad'); else showError(e); }
+          refreshView(true);
+        } }, 'Assign'))));
+    });
+    fill($main, h('div', { class: 'stack' },
+      pageHead('Unrouted queue', 'Tickets that matched no rule, or whose mailbox had nobody scheduled. Choose a mailbox to assign one. Unless you pick someone, it goes to the scheduled person with the fewest tickets today.'),
+      h('div', { class: 'panel table-scroll' }, rows.length ? h('table', { class: 'data' }, h('thead', null, h('tr', null,
+        ['Ticket', 'Subject', 'Category', 'Why it is here', 'Status', 'Waiting since', 'Assign'].map((t) => h('th', { scope: 'col', text: t })))), h('tbody', null, rows))
+        : h('p', { class: 'empty', text: 'Nothing is waiting. Every recent ticket was routed.' }))));
+  }
+
+  /* ───────────────────────── Settings ───────────────────────── */
+  const AUDIT_ENTITY = { Schedule: 'Schedule', Mailboxes: 'Mailbox', Rules: 'Rule', Employees: 'Roster', Settings: 'Setting', Admins: 'Admins',
+    SubjectIgnoreList: 'Subject ignore list', StopWords: 'Stop words' };
+  const AUDIT_ACTION = { insert: 'Added', update: 'Edited', remove: 'Removed', move: 'Moved', reorder: 'Reordered', restore: 'Restored' };
+  async function viewSettings() {
+    const [boot, lists] = await Promise.all([api('apiBootstrap'), api('apiGetLists')]);
+    S.boot = Object.assign(S.boot, boot);
+    setRefs(boot.mailboxes, boot.employees);
+    const rowsByKey = {}; (boot.settingRows || []).forEach((r) => { rowsByKey[r.key] = r; });
+
+    const settingsPanel = h('div', { class: 'panel' }, h('h3', { text: 'Automatic assignment' }),
+      h('table', { class: 'data' }, h('tbody', null, Object.keys(boot.settingDefs).map((key) => {
+        const def = boot.settingDefs[key];
+        const input = h('input', { type: 'text', value: String(boot.settings[key]), 'aria-label': def.label, style: 'width:100%' });
+        const btn = h('button', { class: 'btn small', type: 'button', onclick: async () => {
+          const save = async (version) => {
+            try { await api('apiSaveSetting', { requestId: uuid(), key: key, value: input.value, version: version }); toast('Saved: ' + def.label + '.'); refreshView(true); } catch (e) {
+              if (e.type === 'ConflictError') onConflict(e, (cur) => save(cur.version)); else showError(e);
+            }
+          };
+          save(rowsByKey[key] ? rowsByKey[key].version : null);
+        } }, 'Save');
+        return h('tr', null, h('td', { text: def.label }), h('td', { style: 'width:40%' }, input), h('td', null, btn));
+      }))));
+
+    const subj = h('input', { type: 'text', placeholder: 'e.g. RE: Refund not received for order 8812', style: 'flex:1' });
+    const testOut = h('div', { style: 'margin-top:10px' });
+    const testPanel = h('div', { class: 'panel' }, h('h3', { text: 'Test a subject' }),
+      h('p', { class: 'small muted', text: 'See which earlier tickets a subject would match, and how closely. A match at or above the threshold makes it a follow-up.' }),
+      h('form', { class: 'row', onsubmit: async (ev) => {
+        ev.preventDefault(); testOut.textContent = 'Checking…';
+        try {
+          const r = await api('apiTestSubject', { subject: subj.value });
+          fill(testOut, h('p', { class: 'small' }, 'Compared as: ', h('code', { text: r.cleaned || '(nothing left)' })),
+            !r.eligible ? h('div', { class: 'notice', text: 'This subject is too short or on the ignore list, so it is never treated as a follow-up.' }) :
+            !r.matches.length ? h('p', { class: 'muted', text: 'No similar earlier tickets.' }) :
+            h('table', { class: 'data' }, h('thead', null, h('tr', null, ['Earlier ticket', 'Owner', 'Score', ''].map((t) => h('th', { scope: 'col', text: t })))),
+              h('tbody', null, r.matches.map((m) => h('tr', null, h('td', { text: m.ticketId }), h('td', { text: m.owner }), h('td', { text: Math.round(m.score * 100) + '%' }),
+                h('td', null, m.wouldMatch ? h('span', { class: 'pill follow', text: 'Follow-up' }) : h('span', { class: 'pill', text: 'Below threshold' })))))));
+        } catch (e) { fill(testOut, h('div', { class: 'notice bad', text: e.message })); }
+      } }, subj, h('button', { class: 'btn primary', type: 'submit' }, 'Test')), testOut);
+
+    const listPanel = (key, title, help, field, items, placeholder) => {
+      const input = h('input', { type: key === 'Admins' ? 'email' : 'text', placeholder: placeholder, style: 'flex:1' });
+      return h('div', { class: 'panel' }, h('h3', { text: title }), h('p', { class: 'small muted', text: help }),
+        h('div', { class: 'toolbar', style: 'margin-bottom:10px' }, items.length ? items.map((it) => h('span', { class: 'tag', style: 'display:inline-flex' },
+          h('span', { class: 'nm', text: it[field] }), h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Remove ' + it[field], onclick: async () => {
+            try { await api('apiRemoveListItem', { requestId: uuid(), list: key, id: it.id, version: it.version }); } catch (e) { showError(e); }
+            refreshView(true);
+          } }, '×'))) : h('span', { class: 'muted small', text: key === 'StopWords' ? 'Using the built-in list: ' + lists.defaultStopWords.join(', ') : 'Empty.' })),
+        h('form', { class: 'row', onsubmit: async (ev) => {
+          ev.preventDefault();
+          try { const r = await api('apiAddListItem', { requestId: uuid(), list: key, value: input.value }); if (r.status === 'already_present') toast('Already in the list.'); } catch (e) { showError(e); }
+          refreshView(true);
+        } }, input, h('button', { class: 'btn', type: 'submit' }, 'Add')));
+    };
+
+    const audit = h('div', { class: 'table-scroll' }, h('p', { class: 'muted', text: 'Loading…' }));
+    api('apiGetAudit', { limit: 100 }).then((rows) => {
+      fill(audit, rows.length ? h('table', { class: 'data' }, h('thead', null, h('tr', null, ['When', 'Who', 'What', 'Change'].map((t) => h('th', { scope: 'col', text: t })))),
+        h('tbody', null, rows.map((r) => h('tr', null, h('td', { text: fmtDateTime(r.at) }), h('td', { text: String(r.user).split('@')[0] }),
+          h('td', { text: AUDIT_ENTITY[r.entity] || r.entity }), h('td', { text: AUDIT_ACTION[r.action] || r.action }))))) : h('p', { class: 'muted', text: 'No changes yet.' }));
+    }).catch((e) => fill(audit, h('p', { class: 'notice bad', text: e.message })));
+
+    fill($main, h('div', { class: 'stack' },
+      pageHead('Settings', 'Changes apply from the next assignment run.'),
+      h('div', { class: 'grid-2' }, settingsPanel, testPanel),
+      h('div', { class: 'grid-2' },
+        listPanel('SubjectIgnoreList', 'Subjects that are never follow-ups', 'Generic subjects like "password reset" would otherwise send every such ticket to one person.', 'value', lists.SubjectIgnoreList, 'e.g. password reset'),
+        listPanel('StopWords', 'Words ignored when comparing subjects', 'Adding any word here replaces the built-in list.', 'value', lists.StopWords, 'e.g. urgent'),
+        listPanel('Admins', 'Admins', 'Admins can edit the schedule, mailboxes, rules, roster and settings. Everyone else in your organization can view the app and use Run now.', 'email', lists.Admins, 'name@company.com')),
+      h('div', { class: 'panel' }, h('h3', { text: 'Change history' }), audit),
+      h('div', { class: 'panel' }, h('h3', { text: 'After editing the Google Sheet directly' }),
+        h('p', { class: 'small muted', text: 'Edits made straight in the Sheet skip the app\'s safeguards. After an emergency edit, refresh so every open page reloads the corrected data.' }),
+        h('button', { class: 'btn', type: 'button', onclick: async () => { try { await api('apiRefreshAfterManualEdit'); toast('All open pages will reload the latest data.'); } catch (e) { showError(e); } } }, 'Refresh after manual Sheet edit'))));
+  }
+
+  boot();
+})();
+</script>
