@@ -27,6 +27,52 @@ clasp push
 
 ## 3. Configure (`src/QueryConfig.gs`)
 
+### Teams and managers
+
+List every team in `TEAMS`. Order matters: when a ticket matches rules on more than one team, the
+team listed first gets it.
+
+```js
+const TEAMS = [
+  { id: 'billing',  name: 'Billing Support', managers: ['pat.morgan@yourco.com'] },
+  { id: 'payments', name: 'Payments',        managers: ['kim.tran@yourco.com'] },
+];
+```
+
+- `id` is stored in every row (`team_id`). Don't change it once a team has data.
+- Managers can do everything admins can, and are the only ones who can add or remove admins (in
+  **Team settings**). Admins and employees are added in the app, not here.
+- A person can be on one team only. A manager listed on two teams fails the setup check.
+
+### Developer-only settings
+
+`DEVELOPER_SETTINGS` holds the values admins can't change. They apply to every team:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `SUBJECT_MATCH_THRESHOLD` | `0.75` | How similar a subject must be to count as a follow-up (0–1) |
+| `SUBJECT_MIN_WORDS` | `3` | Subjects with fewer meaningful words are never follow-ups |
+| `RUN_NOW_COOLDOWN_MIN` | `2` | Minutes a team waits between Run now clicks |
+| `WRITEBACK_MAX_ATTEMPTS` | `5` | Tries to set the Owner in Ivanti before giving up |
+| `VERTEX_MIN_CONFIDENCE` | `0.7` | Vertex answers below this go to the queue for review |
+
+Run times and days stay in the app: each team's admins set them in **Team settings**.
+
+### Shared queue
+
+`sharedQueue.visibleFields` lists the ticket fields every team can see for tickets no team could
+place (default `['ticketId', 'createdAt']`). Use names from `ivanti.fieldMap`. Keep it short:
+these tickets are visible across teams.
+
+### Ivanti employee lookup
+
+Paste your existing lookup function into `lookupIvantiEmployee_(email)` at the bottom of
+`src/Ivanti.gs`, then set `ivanti.employeeLookup.enabled: true` and `idPath` to where the ID sits in
+what it returns (see [IVANTI_INTEGRATION.md](IVANTI_INTEGRATION.md)). Until then, nobody can be linked
+and nobody receives tickets; the setup check says so.
+
+### Everything else
+
 Every value marked `TODO(dev)`:
 
 | Setting | What to put |
@@ -35,7 +81,6 @@ Every value marked `TODO(dev)`:
 | `ivanti.newIncidentsFilter` | OData filter for Incidents ready to assign (default: no owner, status Logged) |
 | `ivanti.selectFields` / `fieldMap` | Field names in your tenant. `selectFields` are also the fields admins can use in rules. |
 | `ivanti.updateMethod` | `patch` or `put`, depending on your tenant |
-| `ivanti.backfillFilter`, `ownerField` | Only for the one-time history backfill (step 6) |
 | `bigQuery.projectId`, `appDataset`, `location` | From step 1 |
 | `bigQuery.*Table` | Table names, if you used different ones |
 | `bigQuery.ticketHistory` | Leave `table: ''` to use `assignments`, or point it at another existing history table |
@@ -49,41 +94,35 @@ All SQL lives in the `SQL` object in the same file. Only `SELECT`, `INSERT` and 
 ## 4. Deploy the web app
 
 **Deploy → New deployment → Web app**: *Execute as: Me*, *Who has access: Anyone within your domain*.
-`appsscript.json` already sets this. Open the URL as the app account and check
+`appsscript.json` already sets this. Open the URL as one of the managers and check
 **Run assignment → Check setup**: it must say *Everything is set up*.
 
 ## 5. Switch on automatic runs
 
 On the **Run assignment** page, click **Switch on automatic runs**, or run `installTriggers()` in the
-editor. This installs a 10-minute ticker that starts runs at **6:00 AM and 1:00 PM, Monday to Friday**
-(America/New_York). Admins can change the times and days in Settings.
+editor. This installs one 10-minute ticker for all teams. Each team runs separately, at its own times: by
+default **6:00 AM and 1:00 PM, Monday to Friday** (America/New_York). Each team's admins can change
+their times and days in **Team settings**.
 
-## 6. Load past tickets as history (recommended)
+## 6. Shadow week, then go live
 
-Follow-ups are found by comparing subjects with earlier tickets. The `assignments` table starts empty,
-so load past Incidents once. In the editor run, for example:
-
-```js
-backfillHistoryFromIvanti('2026-01-01')
-```
-
-This only **adds rows** to the existing `assignments` table, marked `routing_method = 'backfill'`.
-They never count toward the ±1 split and are never sent to Ivanti. Owners are matched to the Roster
-by `ivanti_owner_id`, so fill in the Roster first.
-
-## 7. Shadow week, then go live
-
-1. For a week, admins use **Run now** with **Dry run** ticked. Nothing changes in Ivanti, and dry-run
+1. For a week, each team's admins use **Run now** with **Dry run** ticked. A run only handles that team's tickets. Nothing changes in Ivanti, and dry-run
    rows are ignored by history, balancing and the duplicate check.
 2. Compare the Assignment Log (tick *Include dry runs*) with how tickets were really assigned. Use
-   **Settings → Test a subject** to tune the follow-up threshold.
+   **Team settings → Test a subject** to check matches, and adjust `SUBJECT_MATCH_THRESHOLD` if needed.
 3. Switch on automatic runs (step 5).
+
+The ticket history starts empty: follow-ups are found once the app has assigned tickets.
 
 ## Tests
 
 ```bash
-npm test        # node --test; no packages needed (Node 18+)
+npm test          # node --test; no packages needed (Node 18+)
+npm run test:dist # the same tests against the single-file build in dist/
+npm run demo      # builds preview/demo.html, a click-through demo with sample data
 ```
+
+`preview/demo.html` bundles the test mocks and is for review only. Never deploy it.
 
 `tests/noTableCreation.test.js` fails the build if any code tries to create, alter or drop a table,
 dataset, view, Sheet tab or column.

@@ -5,10 +5,10 @@
  * See docs/VERTEX_INTEGRATION.md for the full contract, OAuth scope and testing steps.
  *
  * Flow today:
- *   • A ticket that is not a follow-up and matches no rule gets a row in vertex_queue with
- *     status 'pending' and the payload built by buildVertexPayload_().
- *   • Each run calls classifyTicket_() for those tickets. It returns null today, so they stay
- *     pending and appear on the Unrouted Queue page, where an admin can choose a mailbox.
+ *   • A ticket that matches no team's rules and is not a follow-up is offered to Vertex, which
+ *     chooses among the mailboxes that have a NAME BUT NO RULES (across all teams, A3).
+ *   • classifyTicket_() returns null today, so those tickets go to the SHARED queue, which every
+ *     team's managers and admins see; any of them can pull a ticket into their own mailbox.
  *   • processVertexQueue() re-tries pending rows (run it from the editor or a trigger once
  *     classifyTicket_() is implemented, to classify tickets queued earlier).
  * Vertex code must use BigQuery.gs for any BigQuery access and must not create tables (D23).
@@ -28,7 +28,9 @@ function buildVertexPayload_(ticket, snapshot) {
     subcategory: ticket.subcategory || '',
     created_at: ticket.createdAt || '',
     fields: ticket.fields || {},
-    candidate_mailboxes: snapshot.mailboxes.map((m) => ({ mailbox_id: m.id, name: m.name, description: m.description || '' })),
+    // Only rule-less mailboxes are Vertex candidates (A3). Each carries its team.
+    candidate_mailboxes: Rules.ruleless(snapshot).map((c) => ({ mailbox_id: c.mailbox.id, name: c.mailbox.name,
+      description: c.mailbox.description || '', team_id: c.teamId, team_name: c.teamName })),
   };
 }
 

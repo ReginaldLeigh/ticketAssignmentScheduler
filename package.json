@@ -5,7 +5,12 @@
   "description": "Google Apps Script app that schedules employees onto support mailboxes and assigns Ivanti tickets.",
   "scripts": {
     "test": "node --test tests/*.test.js",
+    "condense": "python3 tools/condense.py",
+    "demo": "python3 tools/build_demo.py",
+    "test:dist": "APP_SRC=dist node --test tests/*.test.js",
     "push": "clasp push"
   },
-  "engines": { "node": ">=18" }
+  "engines": {
+    "node": ">=18"
+  }
 }

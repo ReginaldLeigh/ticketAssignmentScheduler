@@ -12,6 +12,10 @@
  *   • all changes in one mutate() are held in memory and written together at the end, so a
  *     validation error part-way through writes nothing.
  *
+ * Teams (change request §5): every tab has team_id. A change set created for a team (ctx.teamId)
+ * sees only that team's rows by default, stamps team_id on new rows, and refuses to touch another
+ * team's records, a second line of defence behind the checks in WebApp.gs.
+ *
  * No table creation (D23): Store only opens the configured spreadsheet and reads/writes rows on
  * tabs that a developer has already created. It never adds, removes or renames tabs or columns.
  */
@@ -19,6 +23,8 @@
 const STORE_LOCK_WAIT_MS = 10000;
 const STORE_REQUEST_TTL_S = 600;
 const STORE_MAX_CELL = 45000;
+/** Never written to the AuditLog (shown as [hidden]). */
+const STORE_REDACTED_FIELDS = ['ivanti_owner_id'];
 
 const Store = {
   ss_: null,
@@ -144,18 +150,23 @@ const Store = {
 
   /* ─────────────────────────────── Public read API ─────────────────────────────── */
 
-  /** Records of a tab (soft-deleted schedule rows excluded unless includeDeleted). No lock. */
+  /**
+   * Records of a tab (soft-deleted schedule rows excluded unless includeDeleted). No lock.
+   * opts.teamId limits the result to one team; without it, every team's rows are returned
+   * (only used by server-side code such as the assignment run, never sent to a browser as is).
+   */
   read(name, opts) {
     const t = Store.load_(name);
-    return t.records.filter((r) => (opts && opts.includeDeleted) || !Store.isDeleted_(t.spec, r)).map(Store.clean_);
+    const teamId = opts && opts.teamId;
+    return t.records.filter((r) => ((opts && opts.includeDeleted) || !Store.isDeleted_(t.spec, r)) &&
+      (!teamId || r.team_id === teamId)).map(Store.clean_);
   },
 
-  /** Consistent read of several tabs at once (taken under the lock so no save is half-visible). */
+  /** Consistent read of several tabs at once, all teams (taken under the lock so no save is half-visible). */
   snapshot(names) {
     return Store.withLock(() => {
       const out = {};
       names.forEach((n) => { out[n] = Store.read(n); });
-      out._revisions = Store.getRevisions();
       return out;
     });
   },
@@ -189,24 +200,20 @@ const Store = {
 
   /* ─────────────────────────────── Revisions & audit ─────────────────────────────── */
 
-  getRevisions() {
+  /** Revision numbers per tab for one team (open pages poll these to know when to refresh). */
+  getRevisions(teamId) {
     const props = PropertiesService.getScriptProperties().getProperties();
     const out = {};
-    Object.keys(REQUIRED_SHEET_TABS).forEach((tab) => { out[tab] = Number(props['rev:' + tab] || 0); });
+    Object.keys(REQUIRED_SHEET_TABS).forEach((tab) => { out[tab] = Number(props['rev:' + (teamId || '_') + ':' + tab] || 0); });
     return out;
   },
 
-  bumpRevisions_(tabs) {
+  bumpRevisions_(tabs, teamId) {
     const props = PropertiesService.getScriptProperties();
     tabs.forEach((tab) => {
-      const cur = Number(props.getProperty('rev:' + tab) || 0);
-      props.setProperty('rev:' + tab, String(cur + 1));
+      const key = 'rev:' + (teamId || '_') + ':' + tab;
+      props.setProperty(key, String(Number(props.getProperty(key) || 0) + 1));
     });
-  },
-
-  /** Bump every revision (after an emergency manual edit of the Sheet) so all open pages reload. */
-  bumpAllRevisions() {
-    Store.withLock(() => Store.bumpRevisions_(Object.keys(REQUIRED_SHEET_TABS)));
   },
 
   /** Append rows to AuditLog without loading the whole tab. Called inside the lock. */
@@ -226,12 +233,12 @@ const Store = {
     sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
   },
 
-  /** Most recent audit entries (newest first). */
-  readAuditTail(limit) {
+  /** Most recent audit entries for one team (newest first). Reads the last rows only. */
+  readAuditTail(limit, teamId) {
     const sheet = Store.tab_('AuditLog');
     const last = sheet.getLastRow();
     if (last < 2) return [];
-    const n = Math.min(limit || 50, last - 1);
+    const n = Math.min((limit || 50) * (teamId ? 5 : 1), last - 1);
     const headers = Store.headers('AuditLog');
     const values = sheet.getRange(last - n + 1, 1, n, headers.length).getValues();
     const spec = REQUIRED_SHEET_TABS.AuditLog;
@@ -239,7 +246,7 @@ const Store = {
       const o = {};
       headers.forEach((h, i) => { if (spec.columns[h]) o[h] = Store.fromCell_(spec.columns[h], row[i]); });
       return o;
-    }).reverse();
+    }).reverse().filter((e) => !teamId || e.team_id === teamId).slice(0, limit || 50);
   },
 };
 
@@ -261,15 +268,27 @@ class StoreTx_ {
     return this.tabs[name];
   }
 
-  /** Current rows (fresh, read inside the lock), including changes made earlier in this tx. */
+  /** True if this tx is limited to one team and the tab is team-scoped. */
+  scoped_(t) { return !!this.ctx.teamId && ('team_id' in t.spec.columns); }
+
+  /**
+   * Current rows (fresh, read inside the lock), including changes made earlier in this tx.
+   * In a team tx only that team's rows are returned, unless opts.allTeams (used only for the
+   * one-team-per-person check, which must look across teams).
+   */
   rows(name, opts) {
     const t = this.t_(name);
-    return t.records.filter((r) => (opts && opts.includeDeleted) || !Store.isDeleted_(t.spec, r)).map(Store.clean_);
+    const all = opts && opts.allTeams;
+    return t.records.filter((r) => ((opts && opts.includeDeleted) || !Store.isDeleted_(t.spec, r)) &&
+      (all || !this.scoped_(t) || r.team_id === this.ctx.teamId)).map(Store.clean_);
   }
 
+  /** Finds a record by id; in a team tx, records of other teams are treated as not existing. */
   findRaw_(name, id) {
     const t = this.t_(name);
-    return t.records.find((r) => String(r[t.spec.idField]) === String(id)) || null;
+    const rec = t.records.find((r) => String(r[t.spec.idField]) === String(id)) || null;
+    if (rec && this.scoped_(t) && rec.team_id !== this.ctx.teamId) return null;
+    return rec;
   }
 
   find(name, id) { return Store.clean_(this.findRaw_(name, id)); }
@@ -280,7 +299,11 @@ class StoreTx_ {
     const rec = {};
     Object.keys(spec.columns).forEach((c) => { rec[c] = data[c] !== undefined ? data[c] : null; });
     if (spec.idField === 'id' && !rec.id) rec.id = Utilities.getUuid();
-    if (spec.idField && this.findRaw_(name, rec[spec.idField])) {
+    if (this.scoped_(t)) {
+      if (rec.team_id && rec.team_id !== this.ctx.teamId) throw new PermissionError('That belongs to another team.');
+      rec.team_id = this.ctx.teamId;
+    }
+    if (spec.idField && t.records.some((r) => String(r[spec.idField]) === String(rec[spec.idField]))) {
       throw new ConflictError('A record with this id already exists.', { id: rec[spec.idField] });
     }
     if ('version' in spec.columns) rec.version = 1;
@@ -305,7 +328,7 @@ class StoreTx_ {
     }
     const before = Store.clean_(rec);
     Object.keys(changes || {}).forEach((k) => {
-      if (k in t.spec.columns && k !== t.spec.idField && k !== 'version' && k !== 'updated_by' && k !== 'updated_at') rec[k] = changes[k];
+      if (k in t.spec.columns && k !== t.spec.idField && k !== 'team_id' && k !== 'version' && k !== 'updated_by' && k !== 'updated_at') rec[k] = changes[k];
     });
     if ('version' in t.spec.columns) rec.version = Number(rec.version || 0) + 1;
     if ('updated_by' in t.spec.columns) rec.updated_by = this.ctx.user || 'system';
@@ -328,8 +351,11 @@ class StoreTx_ {
   }
 
   audit_(entity, entityId, action, before, after) {
+    // Ivanti IDs never appear in the change history (change request §4).
+    const redact = (r) => { if (!r) return r; const o = Object.assign({}, r); STORE_REDACTED_FIELDS.forEach((f) => { if (f in o) o[f] = o[f] ? '[hidden]' : ''; }); return o; };
+    before = redact(before); after = redact(after);
     this.audits.push({
-      at: this.now, user: this.ctx.user || 'system', entity: entity, entity_id: entityId === null ? '' : String(entityId),
+      at: this.now, team_id: this.ctx.teamId || '', user: this.ctx.user || 'system', entity: entity, entity_id: entityId === null ? '' : String(entityId),
       action: action, before_json: before ? JSON.stringify(before) : '', after_json: after ? JSON.stringify(after) : '',
       request_id: this.ctx.requestId || '',
     });
@@ -350,7 +376,7 @@ class StoreTx_ {
     });
     Store.appendAudit_(this.audits);
     const touched = Object.keys(this.touched);
-    if (touched.length) Store.bumpRevisions_(touched.concat(this.audits.length ? ['AuditLog'] : []));
+    if (touched.length) Store.bumpRevisions_(touched.concat(this.audits.length ? ['AuditLog'] : []), this.ctx.teamId);
     SpreadsheetApp.flush();
   }
 }

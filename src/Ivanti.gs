@@ -101,3 +101,48 @@ const Ivanti = {
     return results;
   },
 };
+
+/* ───────────────────────── Employee lookup by email (change request §4) ───────────────────────── */
+
+/**
+ * TODO(Ivanti-lookup): paste the existing function here, or call it from here.
+ * Admins never see or type Ivanti IDs: the app uses this to find each employee's ID from their email.
+ *
+ * @param {string} email  employee email (lower-case)
+ * @return {Object|string|null} the Ivanti API's JSON for that employee (an object or a JSON string),
+ *         or null if Ivanti has no employee with that email. Throw if Ivanti can't be reached.
+ *
+ * Then, in QueryConfig.gs: set ivanti.employeeLookup.idPath to where the ID sits in that JSON
+ * (e.g. 'RecId' or 'value.0.RecId') and set ivanti.employeeLookup.enabled = true.
+ */
+function lookupIvantiEmployee_(email) { // eslint-disable-line no-unused-vars
+  return null;
+}
+
+const IvantiLookup = {
+  /**
+   * Find an employee's Ivanti ID. Never throws.
+   * @return {{status:'found'|'not_found'|'error', id:(string|null), error:(string|null)}}
+   */
+  resolve(email) {
+    const cfg = QUERY_CONFIG.ivanti.employeeLookup || {};
+    if (!cfg.enabled) return { status: 'error', id: null, error: 'Ivanti employee lookup is not set up yet (developer setting).' };
+    let raw;
+    try { raw = lookupIvantiEmployee_(String(email || '').toLowerCase()); } catch (e) {
+      return { status: 'error', id: null, error: 'Ivanti could not be reached: ' + String((e && e.message) || e).slice(0, 200) };
+    }
+    if (raw === null || raw === undefined || raw === '') return { status: 'not_found', id: null, error: null };
+    let obj = raw;
+    if (typeof raw === 'string') {
+      try { obj = JSON.parse(raw); } catch (e) { return { status: 'error', id: null, error: 'The lookup returned text that is not JSON.' }; }
+    }
+    const id = IvantiLookup.pick_(obj, cfg.idPath || 'RecId');
+    if (id === null || id === undefined || String(id).trim() === '') return { status: 'not_found', id: null, error: null };
+    return { status: 'found', id: String(id), error: null };
+  },
+
+  /** Read a dot path such as 'value.0.RecId' from an object. */
+  pick_(obj, path) {
+    return String(path).split('.').reduce((o, k) => (o === null || o === undefined ? undefined : o[k]), obj);
+  },
+};

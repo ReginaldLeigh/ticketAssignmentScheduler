@@ -1,15 +1,15 @@
 /**
  * QueryConfig.gs — THE developer configuration file.
  *
- * Every Ivanti endpoint, filter and field name, every BigQuery table name and column mapping,
- * and every SQL statement the app runs lives in this one file (requirement D13).
- * Nothing else in the app hard-codes a query, endpoint, field or table name.
+ * Everything a developer sets lives here: teams and their managers, developer-only settings,
+ * every Ivanti endpoint, filter and field name, every BigQuery table name and column mapping,
+ * and every SQL statement the app runs (D13). Nothing else hard-codes these.
  *
  * ┌──────────────────────────────────────────────────────────────────────────────────────────┐
  * │  NO TABLE CREATION (D23)                                                                 │
  * │  This app NEVER creates, alters or drops BigQuery datasets/tables/views, and never adds   │
  * │  Google Sheet tabs or columns. A DEVELOPER creates every table listed below, by hand,     │
- * │  from docs/SCHEMA.md. If a table is missing, runs stop and the Runs page lists what is    │
+ * │  from docs/SCHEMA.md. If a table is missing, runs stop and the Setup check lists what is  │
  * │  missing. Any code that tries to create a table is blocked at runtime (BigQuery.gs,       │
  * │  Store.gs) and fails the NoTableCreation unit tests (tests/noTableCreation.test.js).      │
  * └──────────────────────────────────────────────────────────────────────────────────────────┘
@@ -18,10 +18,36 @@
  *   IVANTI_API_KEY   (required)  Ivanti Neurons for ITSM REST API key
  */
 
+/* ───────────────────────────────────────── Teams ───────────────────────────────────────── */
+/**
+ * One entry per manager's team. Developer-only.
+ *  • id        permanent (stored with every row); lower-case letters, digits, - or _. Never reuse or rename.
+ *  • name      shown in the app
+ *  • managers  emails of the team's managers. Managers have every admin permission, and only they
+ *              can add or remove the team's Admins (in the app, Team settings page).
+ * A person can be on ONE team only (as manager, admin or employee). ORDER MATTERS: when two teams'
+ * mailbox rules both match a ticket, the team listed first gets it.
+ */
+const TEAMS = [
+  // TODO(dev): replace with your teams.
+  // { id: 'billing',  name: 'Billing Support', managers: ['pat.manager@yourco.com'] },
+  // { id: 'payments', name: 'Payments',        managers: ['kim.manager@yourco.com'] },
+];
+
+/* ────────────────────────────────── Developer-only settings ───────────────────────────────── */
+/** Not shown or editable in the app. Validated by the setup check (runs stop if one is invalid). */
+const DEVELOPER_SETTINGS = {
+  SUBJECT_MATCH_THRESHOLD: 0.75,   // follow-up match threshold (0.3–1)
+  SUBJECT_MIN_WORDS: 3,            // minimum meaningful words for a subject to count as a follow-up (1–10)
+  RUN_NOW_COOLDOWN_MIN: 2,         // minutes after a team's run before Run now works again for that team (0–60)
+  WRITEBACK_MAX_ATTEMPTS: 5,       // Ivanti Owner update retries (1–20)
+  VERTEX_MIN_CONFIDENCE: 0.7,      // below this, a Vertex suggestion goes to people for review (0–1)
+};
+
 const QUERY_CONFIG = {
   /* ─────────────────────────────── Ivanti Neurons for ITSM ─────────────────────────────── */
   ivanti: {
-    // The ONLY ticket source (D5).
+    // The ONLY ticket source (D5). All teams' tickets come from this one filter; mailbox rules decide the team.
     baseUrl: '',                                            // TODO(dev): e.g. https://<tenant>.ivanticloud.com
     incidentsPath: '/api/odata/businessobject/incidents',   // TODO(dev): confirm for your tenant
 
@@ -55,11 +81,12 @@ const QUERY_CONFIG = {
     authHeaderName: 'Authorization',
     authHeaderTemplate: 'rest_api_key={key}',
 
-    // Developer-run history backfill (Backfill.gs): which past Incidents to load.
-    // '{fromIso}' is replaced with the start date (ISO 8601).  TODO(dev): confirm.
-    backfillFilter: "Owner ne null and CreatedDateTime ge {fromIso}",
-    // Ivanti field that holds the owner on past Incidents (matched to Employees.ivanti_owner_id).
-    ownerField: 'Owner',
+    // Looking up an employee's Ivanti ID from their email (Ivanti.gs → lookupIvantiEmployee_).
+    // Admins never see or enter Ivanti IDs; the app finds them with this lookup.
+    employeeLookup: {
+      enabled: false,     // TODO(dev): set true once lookupIvantiEmployee_() contains the existing function
+      idPath: 'RecId',    // TODO(dev): where the ID is in the JSON the function returns, e.g. 'RecId' or 'value.0.RecId'
+    },
   },
 
   /* ──────────────────────────────────────── BigQuery ─────────────────────────────────────── */
@@ -73,19 +100,20 @@ const QUERY_CONFIG = {
      * WHERE:      <appDataset>.assignments  → set assignmentsTable below (name, or dataset.table,
      *             or project.dataset.table)
      * PURPOSE:    One row per Ivanti ticket the app assigns. It is:
-     *               • the ticket HISTORY for follow-up matching (D2, D24): subject + employee_id
+     *               • the ticket HISTORY for follow-up matching (within each team)
      *               • the source of today's ±1 balance counts (counts_toward_balance = TRUE only)
      *               • the duplicate check (a ticket with a non-dry-run row is never re-assigned)
      *               • the Ivanti Owner writeback status, used for retries
-     *               • the data behind the Assignment Log page
+     *               • the data behind each team's Assignment Log
      * SCHEMA (column · type · mode):
      *   ticket_id              STRING     REQUIRED   Ivanti IncidentNumber; unique key (MERGE)
+     *   team_id                STRING     REQUIRED   TEAMS[].id of the team that got the ticket
      *   ivanti_rec_id          STRING     REQUIRED   Ivanti RecId; used to set the Owner
      *   subject                STRING     REQUIRED   compared with new tickets for follow-ups
      *   mailbox_id             STRING     NULLABLE   Mailboxes.id
      *   employee_id            STRING     NULLABLE   Employees.id (the owner follow-ups return to)
-     *   routing_method         STRING     REQUIRED   rule | follow_up | vertex | manual | backfill
-     *   counts_toward_balance  BOOL       REQUIRED   FALSE for follow-ups and backfill (D7)
+     *   routing_method         STRING     REQUIRED   rule | follow_up | vertex | manual
+     *   counts_toward_balance  BOOL       REQUIRED   FALSE for follow-ups (D7)
      *   matched_ticket_id      STRING     NULLABLE   earlier ticket a follow-up matched
      *   match_score            FLOAT64    NULLABLE   0–1
      *   rule_id                STRING     NULLABLE   Rules.id that routed it
@@ -94,13 +122,13 @@ const QUERY_CONFIG = {
      *   run_id                 STRING     NULLABLE   runs.run_id (NULL for manual actions)
      *   dry_run                BOOL       REQUIRED   dry-run rows are ignored by history/dedupe/balance
      *   assigned_at            TIMESTAMP  REQUIRED
-     *   assigned_by            STRING     NULLABLE   'system', 'backfill', or the admin's email
+     *   assigned_by            STRING     NULLABLE   'system' or the person's email
      *   version                INT64      REQUIRED   optimistic-concurrency version (starts at 1)
-     *   writeback_status       STRING     REQUIRED   pending | success | failed | skipped_dry_run | not_applicable
+     *   writeback_status       STRING     REQUIRED   pending | success | failed | skipped_dry_run
      *   writeback_attempts     INT64      REQUIRED
      *   writeback_error        STRING     NULLABLE
      *   ticket_snapshot_json   JSON       NULLABLE   Ivanti fields used for routing
-     * PARTITION:  DATE(assigned_at)        CLUSTER: mailbox_id, employee_id
+     * PARTITION:  DATE(assigned_at)        CLUSTER: team_id, mailbox_id, employee_id
      * ACCESS:     app account → BigQuery Data Editor on THIS TABLE ONLY (never on the dataset)
      * WRITES:     MERGE on ticket_id (BigQuery.gs) · READS: Balancer, FollowUp, Pipeline, Assignment Log
      * CHECKED BY: SchemaCheck.gs → checkSchema() against REQUIRED_SCHEMA.assignments
@@ -110,11 +138,11 @@ const QUERY_CONFIG = {
     /* ───────────────────────────── REQUIRED TABLE — P2 `runs` ────────────────────────────
      * CREATED BY: a developer. This app NEVER creates or alters tables (D23). See docs/SCHEMA.md.
      * WHERE:      <appDataset>.runs  → set runsTable below
-     * PURPOSE:    One row per assignment run (scheduled 6 AM / 1 PM weekdays, Run now, or a
-     *             continuation). Powers the Run Assignment page (status, who started it, counts,
-     *             errors) and records which scheduled slot each run covered.
+     * PURPOSE:    One row per assignment run of one team (scheduled, Run now, or a continuation).
+     *             Powers the Run Assignment page and records which scheduled slot each run covered.
      * SCHEMA (column · type · mode):
      *   run_id              STRING     REQUIRED   unique key
+     *   team_id             STRING     REQUIRED   TEAMS[].id of the team the run was for
      *   trigger_type        STRING     REQUIRED   scheduled | manual | continuation
      *   triggered_by        STRING     REQUIRED   email, or 'system'
      *   run_slot            STRING     NULLABLE   e.g. '2026-11-16 06:00' (scheduled runs only)
@@ -129,7 +157,7 @@ const QUERY_CONFIG = {
      *   unrouted            INT64      NULLABLE
      *   writeback_failures  INT64      NULLABLE
      *   errors_json         JSON       NULLABLE
-     * PARTITION:  DATE(started_at)
+     * PARTITION:  DATE(started_at)        CLUSTER: team_id
      * ACCESS:     app account → BigQuery Data Editor on THIS TABLE ONLY
      * WRITES:     MERGE on run_id · READS: Run Assignment page
      * CHECKED BY: SchemaCheck.gs → checkSchema() against REQUIRED_SCHEMA.runs
@@ -139,15 +167,20 @@ const QUERY_CONFIG = {
     /* ────────────────────────── REQUIRED TABLE — P3 `vertex_queue` ───────────────────────
      * CREATED BY: a developer. This app NEVER creates or alters tables (D23). See docs/SCHEMA.md.
      * WHERE:      <appDataset>.vertex_queue  → set vertexQueueTable below
-     * PURPOSE:    One row per ticket the app could not route (no rule matched and not a
-     *             follow-up, or no one scheduled on its mailbox). Holds the structured payload
-     *             for Vertex (added later by a developer) and backs the Unrouted Queue page.
+     * PURPOSE:    One row per ticket the app could not assign:
+     *               • team_id set   → TEAM QUEUE: the team is known but nobody (linked) is scheduled
+     *               • team_id NULL  → SHARED QUEUE: no team's rules, history or Vertex could place it;
+     *                                 every team's managers and admins see it and can pull it in
+     *             Holds the structured payload for Vertex (added later by a developer).
      * SCHEMA (column · type · mode):
      *   ticket_id          STRING     REQUIRED   unique key
+     *   team_id            STRING     NULLABLE   NULL = shared queue
+     *   claimed_by_team    STRING     NULLABLE   team that pulled a shared ticket
      *   payload_json       JSON       REQUIRED   Vertex payload (see Vertex.gs)
      *   status             STRING     REQUIRED   pending | classified | failed | manual_review |
-     *                                            no_one_scheduled | resolved_manually | routed
-     *   reason             STRING     NULLABLE   no_rule_match | no_one_scheduled
+     *                                            no_one_scheduled | no_linked_employee |
+     *                                            resolved_manually | routed
+     *   reason             STRING     NULLABLE   no_rule_match | no_one_scheduled | no_linked_employee
      *   result_mailbox_id  STRING     NULLABLE
      *   confidence         FLOAT64    NULLABLE
      *   rationale          STRING     NULLABLE
@@ -155,20 +188,21 @@ const QUERY_CONFIG = {
      *   created_at         TIMESTAMP  REQUIRED
      *   processed_at       TIMESTAMP  NULLABLE
      *   version            INT64      REQUIRED
-     * CLUSTER:    status
+     * CLUSTER:    status, team_id
      * ACCESS:     app account → BigQuery Data Editor on THIS TABLE ONLY
-     * WRITES:     MERGE on ticket_id · READS: Unrouted Queue page, processVertexQueue()
+     * WRITES:     MERGE on ticket_id · READS: Unrouted queue page, processVertexQueue()
      * CHECKED BY: SchemaCheck.gs → checkSchema() against REQUIRED_SCHEMA.vertex_queue
      * ───────────────────────────────────────────────────────────────────────────────────── */
     vertexQueueTable: 'vertex_queue',
 
     // Where follow-up matching looks for earlier tickets (D24).
     // Default ('' table) = the assignments table above. A developer may point this at another
-    // EXISTING table of Ivanti ticket history (the app only SELECTs from it).
+    // EXISTING table of ticket history (the app only SELECTs from it).
     ticketHistory: {
       table: '',
       columns: {
         ticketId: 'ticket_id',
+        team: 'team_id',              // follow-ups are matched within a team (A4)
         subject: 'subject',
         owner: 'employee_id',
         mailbox: 'mailbox_id',        // '' if the history table has no mailbox column
@@ -186,6 +220,15 @@ const QUERY_CONFIG = {
     spreadsheetId: '',    // TODO(dev): spreadsheet whose tabs are listed in REQUIRED_SHEET_TABS (created by a developer)
   },
 
+  /* ─────────────────────────────────────── Shared queue ──────────────────────────────────── */
+  sharedQueue: {
+    // TODO(dev): which ticket fields EVERY team may see for tickets that no team could place.
+    // Only these are sent to the browser; everything else is stripped on the server.
+    // Use app names (ticketId, createdAt, subject, description, category, subcategory) or any
+    // Ivanti field name from ivanti.selectFields. Placeholder: ticket number and arrival time.
+    visibleFields: ['ticketId', 'createdAt'],
+  },
+
   /* ─────────────────────────────────── Subject matching ──────────────────────────────────── */
   subjectMatching: {
     // Leading reply/forward prefixes and tags removed before comparing subjects.
@@ -197,14 +240,12 @@ const QUERY_CONFIG = {
 /**
  * REQUIRED_SCHEMA — what SchemaCheck.gs expects each developer-created table to contain.
  * This is a READ-ONLY specification used to CHECK tables. The app never uses it to build tables.
- * Types use GoogleSQL names; SchemaCheck also accepts the legacy aliases BigQuery reports
- * (BOOLEAN, INTEGER, FLOAT).
  */
 const REQUIRED_SCHEMA = {
   assignments: {
     configKey: 'assignmentsTable',
     columns: [
-      ['ticket_id', 'STRING', 'REQUIRED'], ['ivanti_rec_id', 'STRING', 'REQUIRED'],
+      ['ticket_id', 'STRING', 'REQUIRED'], ['team_id', 'STRING', 'REQUIRED'], ['ivanti_rec_id', 'STRING', 'REQUIRED'],
       ['subject', 'STRING', 'REQUIRED'], ['mailbox_id', 'STRING', 'NULLABLE'],
       ['employee_id', 'STRING', 'NULLABLE'], ['routing_method', 'STRING', 'REQUIRED'],
       ['counts_toward_balance', 'BOOL', 'REQUIRED'], ['matched_ticket_id', 'STRING', 'NULLABLE'],
@@ -220,7 +261,7 @@ const REQUIRED_SCHEMA = {
   runs: {
     configKey: 'runsTable',
     columns: [
-      ['run_id', 'STRING', 'REQUIRED'], ['trigger_type', 'STRING', 'REQUIRED'],
+      ['run_id', 'STRING', 'REQUIRED'], ['team_id', 'STRING', 'REQUIRED'], ['trigger_type', 'STRING', 'REQUIRED'],
       ['triggered_by', 'STRING', 'REQUIRED'], ['run_slot', 'STRING', 'NULLABLE'],
       ['dry_run', 'BOOL', 'REQUIRED'], ['started_at', 'TIMESTAMP', 'REQUIRED'],
       ['finished_at', 'TIMESTAMP', 'NULLABLE'], ['status', 'STRING', 'REQUIRED'],
@@ -233,7 +274,8 @@ const REQUIRED_SCHEMA = {
   vertex_queue: {
     configKey: 'vertexQueueTable',
     columns: [
-      ['ticket_id', 'STRING', 'REQUIRED'], ['payload_json', 'JSON', 'REQUIRED'],
+      ['ticket_id', 'STRING', 'REQUIRED'], ['team_id', 'STRING', 'NULLABLE'], ['claimed_by_team', 'STRING', 'NULLABLE'],
+      ['payload_json', 'JSON', 'REQUIRED'],
       ['status', 'STRING', 'REQUIRED'], ['reason', 'STRING', 'NULLABLE'],
       ['result_mailbox_id', 'STRING', 'NULLABLE'], ['confidence', 'FLOAT64', 'NULLABLE'],
       ['rationale', 'STRING', 'NULLABLE'], ['attempts', 'INT64', 'REQUIRED'],
@@ -245,36 +287,31 @@ const REQUIRED_SCHEMA = {
 
 /**
  * REQUIRED_SHEET_TABS — tabs a developer creates in the configured spreadsheet, with row 1
- * holding exactly these headers (extra columns to the right are allowed and preserved).
- * The app NEVER adds tabs or columns; it only reads and writes rows.
- * Column types tell Store.gs how to read/write values.
+ * holding exactly these headers (any order; extra columns are allowed and preserved).
+ * The app NEVER adds tabs or columns; it only reads and writes rows. Every tab carries team_id:
+ * each team only ever sees its own rows (enforced in Store.gs and WebApp.gs).
  */
+const TEAM_COLUMNS = { version: 'number', updated_by: 'string', updated_at: 'datetime' };
 const REQUIRED_SHEET_TABS = {
-  Mailboxes: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', name: 'string', description: 'string', priority: 'number', active: 'bool',
-    version: 'number', updated_by: 'string', updated_at: 'datetime' } },
-  Rules: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', mailbox_id: 'string', conditions_json: 'json', active: 'bool',
-    version: 'number', updated_by: 'string', updated_at: 'datetime' } },
-  Employees: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', employee_email: 'string', display_name: 'string', active: 'bool',
-    ivanti_owner_id: 'string', version: 'number', updated_by: 'string', updated_at: 'datetime' } },
-  Schedule: { idField: 'id', softDelete: 'deleted_at', columns: {
-    id: 'string', date: 'date', mailbox_id: 'string', employee_id: 'string', deleted_at: 'datetime',
-    version: 'number', updated_by: 'string', updated_at: 'datetime' } },
-  Admins: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', email: 'string', active: 'bool', version: 'number', updated_by: 'string',
-    updated_at: 'datetime' } },
-  Settings: { idField: 'key', softDelete: null, columns: {
-    key: 'string', value: 'string', version: 'number', updated_by: 'string', updated_at: 'datetime' } },
-  SubjectIgnoreList: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', value: 'string', active: 'bool', version: 'number', updated_by: 'string',
-    updated_at: 'datetime' } },
-  StopWords: { idField: 'id', softDelete: 'active', columns: {
-    id: 'string', value: 'string', active: 'bool', version: 'number', updated_by: 'string',
-    updated_at: 'datetime' } },
+  Mailboxes: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', name: 'string', description: 'string', priority: 'number', active: 'bool' }, TEAM_COLUMNS) },
+  Rules: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', mailbox_id: 'string', conditions_json: 'json', active: 'bool' }, TEAM_COLUMNS) },
+  Employees: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', employee_email: 'string', display_name: 'string', active: 'bool',
+    ivanti_owner_id: 'string', ivanti_lookup_status: 'string', ivanti_checked_at: 'datetime' }, TEAM_COLUMNS) },
+  Schedule: { idField: 'id', softDelete: 'deleted_at', columns: Object.assign({
+    id: 'string', team_id: 'string', date: 'date', mailbox_id: 'string', employee_id: 'string', deleted_at: 'datetime' }, TEAM_COLUMNS) },
+  Admins: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', email: 'string', active: 'bool' }, TEAM_COLUMNS) },
+  Settings: { idField: 'id', softDelete: null, columns: Object.assign({
+    id: 'string', team_id: 'string', key: 'string', value: 'string' }, TEAM_COLUMNS) },
+  SubjectIgnoreList: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', value: 'string', active: 'bool' }, TEAM_COLUMNS) },
+  StopWords: { idField: 'id', softDelete: 'active', columns: Object.assign({
+    id: 'string', team_id: 'string', value: 'string', active: 'bool' }, TEAM_COLUMNS) },
   AuditLog: { idField: null, softDelete: null, appendOnly: true, columns: {
-    at: 'datetime', user: 'string', entity: 'string', entity_id: 'string', action: 'string',
+    at: 'datetime', team_id: 'string', user: 'string', entity: 'string', entity_id: 'string', action: 'string',
     before_json: 'string', after_json: 'string', request_id: 'string' } },
 };
 
@@ -299,7 +336,7 @@ GROUP BY mailbox_id, employee_id`,
   assignmentsMerge: (t) => `-- op:assignments.merge
 MERGE ${t} T
 USING (
-  SELECT r.ticket_id, r.ivanti_rec_id, r.subject, r.mailbox_id, r.employee_id, r.routing_method,
+  SELECT r.ticket_id, r.team_id, r.ivanti_rec_id, r.subject, r.mailbox_id, r.employee_id, r.routing_method,
          r.counts_toward_balance, r.matched_ticket_id, r.match_score, r.rule_id, r.rule_version,
          r.config_revision, r.run_id, r.dry_run, TIMESTAMP(r.assigned_at) AS assigned_at,
          r.assigned_by, r.writeback_status, r.writeback_attempts, r.writeback_error,
@@ -308,7 +345,7 @@ USING (
 ) S
 ON T.ticket_id = S.ticket_id
 WHEN MATCHED AND T.dry_run = TRUE THEN UPDATE SET
-  ivanti_rec_id = S.ivanti_rec_id, subject = S.subject, mailbox_id = S.mailbox_id,
+  team_id = S.team_id, ivanti_rec_id = S.ivanti_rec_id, subject = S.subject, mailbox_id = S.mailbox_id,
   employee_id = S.employee_id, routing_method = S.routing_method,
   counts_toward_balance = S.counts_toward_balance, matched_ticket_id = S.matched_ticket_id,
   match_score = S.match_score, rule_id = S.rule_id, rule_version = S.rule_version,
@@ -317,12 +354,12 @@ WHEN MATCHED AND T.dry_run = TRUE THEN UPDATE SET
   writeback_status = S.writeback_status, writeback_attempts = S.writeback_attempts,
   writeback_error = S.writeback_error, ticket_snapshot_json = S.ticket_snapshot_json
 WHEN NOT MATCHED THEN INSERT (
-  ticket_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
+  ticket_id, team_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
   counts_toward_balance, matched_ticket_id, match_score, rule_id, rule_version, config_revision,
   run_id, dry_run, assigned_at, assigned_by, version, writeback_status, writeback_attempts,
   writeback_error, ticket_snapshot_json)
 VALUES (
-  S.ticket_id, S.ivanti_rec_id, S.subject, S.mailbox_id, S.employee_id, S.routing_method,
+  S.ticket_id, S.team_id, S.ivanti_rec_id, S.subject, S.mailbox_id, S.employee_id, S.routing_method,
   S.counts_toward_balance, S.matched_ticket_id, S.match_score, S.rule_id, S.rule_version,
   S.config_revision, S.run_id, S.dry_run, S.assigned_at, S.assigned_by, 1, S.writeback_status,
   S.writeback_attempts, S.writeback_error, S.ticket_snapshot_json)`,
@@ -337,7 +374,7 @@ WHEN MATCHED THEN UPDATE SET
   writeback_error = S.writeback_error`,
 
   assignmentsPendingWritebacks: (t) => `-- op:assignments.pendingWritebacks
-SELECT ticket_id, ivanti_rec_id, employee_id, mailbox_id, writeback_attempts FROM ${t}
+SELECT ticket_id, team_id, ivanti_rec_id, employee_id, mailbox_id, writeback_attempts FROM ${t}
 WHERE dry_run = FALSE AND writeback_status IN ('pending', 'failed')
   AND writeback_attempts < @max_attempts
   AND (run_id IS NULL OR run_id != @current_run_id)
@@ -345,12 +382,13 @@ ORDER BY assigned_at
 LIMIT 200`,
 
   assignmentsSearch: (t) => `-- op:assignments.search
-SELECT ticket_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
+SELECT ticket_id, team_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
        counts_toward_balance, matched_ticket_id, match_score, rule_id, rule_version, run_id, dry_run,
        FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', assigned_at) AS assigned_at, assigned_by, version,
        writeback_status, writeback_attempts, writeback_error
 FROM ${t}
-WHERE DATE(assigned_at, @tz) BETWEEN @from_date AND @to_date
+WHERE team_id = @team_id
+  AND DATE(assigned_at, @tz) BETWEEN @from_date AND @to_date
   AND (@ticket_id = '' OR ticket_id = @ticket_id)
   AND (@employee_id = '' OR employee_id = @employee_id)
   AND (@mailbox_id = '' OR mailbox_id = @mailbox_id)
@@ -359,15 +397,15 @@ ORDER BY assigned_at DESC
 LIMIT 500`,
 
   assignmentsGet: (t) => `-- op:assignments.get
-SELECT ticket_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
+SELECT ticket_id, team_id, ivanti_rec_id, subject, mailbox_id, employee_id, routing_method,
        counts_toward_balance, version, writeback_status, writeback_attempts
 FROM ${t}
-WHERE ticket_id = @ticket_id AND dry_run = FALSE`,
+WHERE ticket_id = @ticket_id AND team_id = @team_id AND dry_run = FALSE`,
 
   assignmentsReassign: (t) => `-- op:assignments.reassign
 MERGE ${t} T
 USING (SELECT @ticket_id AS ticket_id) S
-ON T.ticket_id = S.ticket_id AND T.dry_run = FALSE AND T.version = @expected_version
+ON T.ticket_id = S.ticket_id AND T.team_id = @team_id AND T.dry_run = FALSE AND T.version = @expected_version
 WHEN MATCHED THEN UPDATE SET
   employee_id = @employee_id, assigned_by = @assigned_by, version = T.version + 1,
   writeback_status = 'pending', writeback_attempts = 0, writeback_error = NULL`,
@@ -375,15 +413,16 @@ WHEN MATCHED THEN UPDATE SET
   assignmentsRecentSnapshots: (t) => `-- op:assignments.recentSnapshots
 SELECT ticket_id, subject, TO_JSON_STRING(ticket_snapshot_json) AS snapshot
 FROM ${t}
-WHERE dry_run = FALSE AND ticket_snapshot_json IS NOT NULL
+WHERE team_id = @team_id AND dry_run = FALSE AND ticket_snapshot_json IS NOT NULL
   AND assigned_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 ORDER BY assigned_at DESC
 LIMIT @limit`,
 
   /**
-   * Follow-up matching (D9). New tickets arrive as an ARRAY<STRUCT<ticket_id, seq>> parameter,
-   * where seq is the cleaned, stop-word-free subject (built by Subject.gs). History subjects are
-   * cleaned the same way here in SQL. Score = max(word overlap, containment). No temporary tables.
+   * Follow-up matching (D9) for ONE team's history (A4). New tickets arrive as an
+   * ARRAY<STRUCT<ticket_id, seq>> parameter, where seq is the cleaned, stop-word-free subject
+   * (built by Subject.gs with that team's stop words). History subjects are cleaned the same way
+   * here in SQL. Score = max(word overlap, containment). No temporary tables.
    */
   historyMatch: (t, c) => `-- op:history.match
 WITH new_t AS (
@@ -394,28 +433,30 @@ WITH new_t AS (
 ),
 hist_norm AS (
   SELECT CAST(${c.ticketId} AS STRING) AS h_ticket_id,
+         ${c.team ? `CAST(${c.team} AS STRING)` : 'CAST(NULL AS STRING)'} AS h_team,
          CAST(${c.owner} AS STRING) AS h_owner,
          ${c.mailbox ? `CAST(${c.mailbox} AS STRING)` : 'CAST(NULL AS STRING)'} AS h_mailbox,
          CAST(${c.recordedAt} AS TIMESTAMP) AS h_at,
          TRIM(REGEXP_REPLACE(REGEXP_REPLACE(LOWER(${c.subject}), @prefix_pattern, ''), r'[^a-z0-9]+', ' ')) AS norm
   FROM ${t}
   WHERE ${c.subject} IS NOT NULL AND ${c.owner} IS NOT NULL AND (${c.extraFilter || 'TRUE'})
+    ${c.team ? `AND CAST(${c.team} AS STRING) = @team_id` : ''}
 ),
 hist AS (
-  SELECT h_ticket_id, h_owner, h_mailbox, h_at,
+  SELECT h_ticket_id, h_team, h_owner, h_mailbox, h_at,
          ARRAY_TO_STRING(ARRAY(
            SELECT w FROM UNNEST(SPLIT(norm, ' ')) AS w WITH OFFSET AS o
            WHERE w != '' AND w NOT IN UNNEST(@stop_words) ORDER BY o), ' ') AS seq
   FROM hist_norm
 ),
 hist_t AS (
-  SELECT h_ticket_id, h_owner, h_mailbox, h_at, seq,
+  SELECT h_ticket_id, h_team, h_owner, h_mailbox, h_at, seq,
          ARRAY(SELECT DISTINCT w FROM UNNEST(SPLIT(seq, ' ')) AS w WHERE w != '') AS toks,
          ARRAY_LENGTH(SPLIT(seq, ' ')) AS wc
   FROM hist WHERE seq != ''
 ),
 pairs AS (
-  SELECT n.ticket_id, h.h_ticket_id, h.h_owner, h.h_mailbox, h.h_at,
+  SELECT n.ticket_id, h.h_ticket_id, h.h_team, h.h_owner, h.h_mailbox, h.h_at,
          n.seq AS n_seq, h.seq AS h_seq, n.wc AS n_wc, h.wc AS h_wc,
          ARRAY_LENGTH(n.toks) AS n_len, ARRAY_LENGTH(h.toks) AS h_len,
          (SELECT COUNT(*) FROM UNNEST(n.toks) AS a WHERE a IN UNNEST(h.toks)) AS inter
@@ -423,7 +464,7 @@ pairs AS (
   WHERE h.h_ticket_id != n.ticket_id
 ),
 scored AS (
-  SELECT ticket_id, h_ticket_id, h_owner, h_mailbox, h_at,
+  SELECT ticket_id, h_ticket_id, h_team, h_owner, h_mailbox, h_at,
          GREATEST(
            IFNULL(SAFE_DIVIDE(inter, n_len + h_len - inter), 0),
            IF(LEAST(n_wc, h_wc) >= @min_words AND
@@ -433,7 +474,7 @@ scored AS (
   FROM pairs
   WHERE inter > 0
 )
-SELECT ticket_id, h_ticket_id AS matched_ticket_id, h_owner AS owner, h_mailbox AS mailbox_id,
+SELECT ticket_id, h_ticket_id AS matched_ticket_id, h_team AS team_id, h_owner AS owner, h_mailbox AS mailbox_id,
        score, FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', h_at) AS matched_at
 FROM scored
 WHERE score >= @threshold
@@ -442,7 +483,7 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY score DESC, h_at DESC
   runsUpsert: (t) => `-- op:runs.upsert
 MERGE ${t} T
 USING (
-  SELECT r.run_id, r.trigger_type, r.triggered_by, r.run_slot, r.dry_run,
+  SELECT r.run_id, r.team_id, r.trigger_type, r.triggered_by, r.run_slot, r.dry_run,
          TIMESTAMP(r.started_at) AS started_at, TIMESTAMP(r.finished_at) AS finished_at, r.status,
          r.config_revision, r.fetched, r.assigned, r.follow_ups, r.unrouted, r.writeback_failures,
          SAFE.PARSE_JSON(r.errors_json) AS errors_json
@@ -454,33 +495,33 @@ WHEN MATCHED THEN UPDATE SET
   fetched = S.fetched, assigned = S.assigned, follow_ups = S.follow_ups, unrouted = S.unrouted,
   writeback_failures = S.writeback_failures, errors_json = S.errors_json
 WHEN NOT MATCHED THEN INSERT (
-  run_id, trigger_type, triggered_by, run_slot, dry_run, started_at, finished_at, status,
+  run_id, team_id, trigger_type, triggered_by, run_slot, dry_run, started_at, finished_at, status,
   config_revision, fetched, assigned, follow_ups, unrouted, writeback_failures, errors_json)
 VALUES (
-  S.run_id, S.trigger_type, S.triggered_by, S.run_slot, S.dry_run, S.started_at, S.finished_at,
+  S.run_id, S.team_id, S.trigger_type, S.triggered_by, S.run_slot, S.dry_run, S.started_at, S.finished_at,
   S.status, S.config_revision, S.fetched, S.assigned, S.follow_ups, S.unrouted,
   S.writeback_failures, S.errors_json)`,
 
   runsRecent: (t) => `-- op:runs.recent
-SELECT run_id, trigger_type, triggered_by, run_slot, dry_run,
+SELECT run_id, team_id, trigger_type, triggered_by, run_slot, dry_run,
        FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', started_at) AS started_at,
        FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', finished_at) AS finished_at,
        status, fetched, assigned, follow_ups, unrouted, writeback_failures,
        TO_JSON_STRING(errors_json) AS errors_json
 FROM ${t}
-WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+WHERE team_id = @team_id AND started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 ORDER BY started_at DESC
 LIMIT @limit`,
 
   queueUpsert: (t) => `-- op:queue.upsert
 MERGE ${t} T
-USING (SELECT q.ticket_id, q.payload_json, q.status, q.reason FROM UNNEST(@rows) AS q) S
+USING (SELECT q.ticket_id, q.team_id, q.payload_json, q.status, q.reason FROM UNNEST(@rows) AS q) S
 ON T.ticket_id = S.ticket_id
-WHEN MATCHED AND T.status IN ('pending', 'no_one_scheduled', 'failed', 'manual_review', 'routed') THEN UPDATE SET
-  payload_json = PARSE_JSON(S.payload_json), status = S.status, reason = S.reason,
+WHEN MATCHED AND T.status IN ('pending', 'no_one_scheduled', 'no_linked_employee', 'failed', 'manual_review', 'routed') THEN UPDATE SET
+  team_id = S.team_id, payload_json = PARSE_JSON(S.payload_json), status = S.status, reason = S.reason,
   attempts = T.attempts + 1, version = T.version + 1
-WHEN NOT MATCHED THEN INSERT (ticket_id, payload_json, status, reason, attempts, created_at, version)
-VALUES (S.ticket_id, PARSE_JSON(S.payload_json), S.status, S.reason, 1, CURRENT_TIMESTAMP(), 1)`,
+WHEN NOT MATCHED THEN INSERT (ticket_id, team_id, payload_json, status, reason, attempts, created_at, version)
+VALUES (S.ticket_id, S.team_id, PARSE_JSON(S.payload_json), S.status, S.reason, 1, CURRENT_TIMESTAMP(), 1)`,
 
   queueSetStatus: (t) => `-- op:queue.setStatus
 MERGE ${t} T
@@ -497,13 +538,30 @@ WHEN MATCHED THEN UPDATE SET
   processed_at = CURRENT_TIMESTAMP(),
   version = T.version + 1`,
 
+  /** A team takes a ticket from its own queue or the shared queue. First team wins (version check). */
+  queueClaim: (t) => `-- op:queue.claim
+MERGE ${t} T
+USING (SELECT @ticket_id AS ticket_id) S
+ON T.ticket_id = S.ticket_id AND T.version = @expected_version
+   AND T.status IN ('pending', 'no_one_scheduled', 'no_linked_employee', 'failed', 'manual_review', 'classified')
+   AND (T.team_id IS NULL OR T.team_id = @team_id)
+WHEN MATCHED THEN UPDATE SET
+  status = 'resolved_manually', result_mailbox_id = @mailbox_id, claimed_by_team = @team_id,
+  team_id = @team_id, processed_at = CURRENT_TIMESTAMP(), version = T.version + 1`,
+
   queueList: (t) => `-- op:queue.list
-SELECT ticket_id, TO_JSON_STRING(payload_json) AS payload_json, status, reason, result_mailbox_id,
-       confidence, rationale, attempts,
+SELECT ticket_id, team_id, claimed_by_team, TO_JSON_STRING(payload_json) AS payload_json, status, reason,
+       result_mailbox_id, confidence, rationale, attempts,
        FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', created_at) AS created_at,
        FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', processed_at) AS processed_at, version
 FROM ${t}
 WHERE status IN UNNEST(@statuses)
+  AND (@include_shared AND team_id IS NULL OR team_id = @team_id OR @all_teams)
 ORDER BY created_at
 LIMIT 500`,
+
+  queueGet: (t) => `-- op:queue.get
+SELECT ticket_id, team_id, claimed_by_team, status, version
+FROM ${t}
+WHERE ticket_id = @ticket_id`,
 };

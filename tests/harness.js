@@ -9,7 +9,8 @@ const path = require('path');
 const vm = require('vm');
 const crypto = require('crypto');
 
-const SRC = path.join(__dirname, '..', 'src');
+// APP_SRC=dist runs every test against the single-file build from tools/condense.py.
+const SRC = path.resolve(__dirname, '..', process.env.APP_SRC || 'src');
 const TZ = 'America/New_York';
 
 function gsFiles() { return fs.readdirSync(SRC).filter((f) => f.endsWith('.gs')).sort(); }
@@ -33,6 +34,9 @@ function createMocks() {
     bqTablesGetCalls: [],
     fetchCalls: [], fetchAllCalls: [],
     ivantiIncidents: [], ivantiFailRecIds: new Set(),
+    ivantiPeople: {},           // email → Ivanti RecId, used by the stand-in for lookupIvantiEmployee_
+    ivantiLookupDown: false,    // simulate Ivanti being unreachable for lookups
+    lookupCalls: [],
   };
 
   const mapStore = () => { const m = new Map(); return m; };
@@ -200,26 +204,26 @@ function createMocks() {
         return result(A.filter((r) => !r.dry_run && ['pending', 'failed'].includes(r.writeback_status) && r.writeback_attempts < p.max_attempts &&
           (r.run_id === null || r.run_id !== p.current_run_id)).map((r) => ({ ticket_id: r.ticket_id, ivanti_rec_id: r.ivanti_rec_id, employee_id: r.employee_id, mailbox_id: r.mailbox_id, writeback_attempts: r.writeback_attempts })));
       case 'assignments.search':
-        return result(A.filter((r) => dateIn(r.assigned_at) >= p.from_date && dateIn(r.assigned_at) <= p.to_date && (!p.ticket_id || r.ticket_id === p.ticket_id) &&
+        return result(A.filter((r) => r.team_id === p.team_id && dateIn(r.assigned_at) >= p.from_date && dateIn(r.assigned_at) <= p.to_date && (!p.ticket_id || r.ticket_id === p.ticket_id) &&
           (!p.employee_id || r.employee_id === p.employee_id) && (!p.mailbox_id || r.mailbox_id === p.mailbox_id) && (p.include_dry_run || !r.dry_run)).map((r) => Object.assign({}, r)));
-      case 'assignments.get': return result(A.filter((r) => r.ticket_id === p.ticket_id && !r.dry_run).map((r) => Object.assign({}, r)));
+      case 'assignments.get': return result(A.filter((r) => r.ticket_id === p.ticket_id && r.team_id === p.team_id && !r.dry_run).map((r) => Object.assign({}, r)));
       case 'assignments.reassign': {
-        const t = A.find((r) => r.ticket_id === p.ticket_id && !r.dry_run && r.version === p.expected_version);
+        const t = A.find((r) => r.ticket_id === p.ticket_id && r.team_id === p.team_id && !r.dry_run && r.version === p.expected_version);
         if (!t) return result([], 0);
         Object.assign(t, { employee_id: p.employee_id, assigned_by: p.assigned_by, version: t.version + 1, writeback_status: 'pending', writeback_attempts: 0, writeback_error: null });
         return result([], 1);
       }
-      case 'assignments.recentSnapshots': return result(A.filter((r) => !r.dry_run && r.ticket_snapshot_json).slice(-p.limit).map((r) => ({ ticket_id: r.ticket_id, subject: r.subject, snapshot: r.ticket_snapshot_json })));
+      case 'assignments.recentSnapshots': return result(A.filter((r) => r.team_id === p.team_id && !r.dry_run && r.ticket_snapshot_json).slice(-p.limit).map((r) => ({ ticket_id: r.ticket_id, subject: r.subject, snapshot: r.ticket_snapshot_json })));
       case 'history.match': {
         const out = [];
         p.new_tickets.forEach((n) => {
-          const scored = A.filter((h) => !h.dry_run && h.subject && h.employee_id && h.ticket_id !== n.ticket_id).map((h) => {
+          const scored = A.filter((h) => !h.dry_run && h.subject && h.employee_id && h.ticket_id !== n.ticket_id && h.team_id === p.team_id).map((h) => {
             const hs = sqlSeq(h.subject, p.prefix_pattern, p.stop_words);
             return { h, score: hs ? sqlScore(n.seq, hs, p.min_words) : 0 };
           }).filter((x) => x.score > 0 && x.score >= p.threshold)
             .sort((a, b) => b.score - a.score || String(b.h.assigned_at).localeCompare(String(a.h.assigned_at)))
             .slice(0, p.limit_per_ticket);
-          scored.forEach((x) => out.push({ ticket_id: n.ticket_id, matched_ticket_id: x.h.ticket_id, owner: x.h.employee_id, mailbox_id: x.h.mailbox_id, score: x.score, matched_at: x.h.assigned_at }));
+          scored.forEach((x) => out.push({ ticket_id: n.ticket_id, matched_ticket_id: x.h.ticket_id, team_id: x.h.team_id, owner: x.h.employee_id, mailbox_id: x.h.mailbox_id, score: x.score, matched_at: x.h.assigned_at }));
         });
         return result(out);
       }
@@ -227,12 +231,12 @@ function createMocks() {
         p.rows.forEach((s) => { const t = R.find((r) => r.run_id === s.run_id); if (t) Object.assign(t, s, { trigger_type: t.trigger_type }); else R.push(Object.assign({}, s)); });
         return result([], p.rows.length);
       }
-      case 'runs.recent': return result(R.slice().reverse().slice(0, p.limit).map((r) => Object.assign({}, r)));
+      case 'runs.recent': return result(R.filter((r) => r.team_id === p.team_id).reverse().slice(0, p.limit).map((r) => Object.assign({}, r)));
       case 'queue.upsert': {
         p.rows.forEach((s) => {
           const t = Q.find((r) => r.ticket_id === s.ticket_id);
-          if (t && ['pending', 'no_one_scheduled', 'failed', 'manual_review', 'routed'].includes(t.status)) Object.assign(t, s, { attempts: t.attempts + 1, version: t.version + 1 });
-          else if (!t) Q.push(Object.assign({}, s, { attempts: 1, version: 1, created_at: new Date().toISOString() }));
+          if (t && ['pending', 'no_one_scheduled', 'no_linked_employee', 'failed', 'manual_review', 'routed'].includes(t.status)) Object.assign(t, s, { attempts: t.attempts + 1, version: t.version + 1 });
+          else if (!t) Q.push(Object.assign({ claimed_by_team: null }, s, { attempts: 1, version: 1, created_at: new Date().toISOString() }));
         });
         return result([], p.rows.length);
       }
@@ -244,7 +248,16 @@ function createMocks() {
         });
         return result([], n);
       }
-      case 'queue.list': return result(Q.filter((r) => p.statuses.includes(r.status)).map((r) => Object.assign({}, r)));
+      case 'queue.list': return result(Q.filter((r) => p.statuses.includes(r.status) &&
+        ((p.include_shared && !r.team_id) || r.team_id === p.team_id || p.all_teams)).map((r) => Object.assign({}, r)));
+      case 'queue.get': return result(Q.filter((r) => r.ticket_id === p.ticket_id).map((r) => Object.assign({}, r)));
+      case 'queue.claim': {
+        const open = ['pending', 'no_one_scheduled', 'no_linked_employee', 'failed', 'manual_review', 'classified'];
+        const t = Q.find((r) => r.ticket_id === p.ticket_id && r.version === p.expected_version && open.includes(r.status) && (!r.team_id || r.team_id === p.team_id));
+        if (!t) return result([], 0);
+        Object.assign(t, { status: 'resolved_manually', result_mailbox_id: p.mailbox_id, claimed_by_team: p.team_id, team_id: p.team_id, version: t.version + 1 });
+        return result([], 1);
+      }
       default: throw new Error('Mock BigQuery: unknown op ' + op);
     }
   }
@@ -256,8 +269,7 @@ function createMocks() {
       state.fetchCalls.push({ url, opts });
       const u = new URL(url);
       const top = Number(u.searchParams.get('$top')), skip = Number(u.searchParams.get('$skip'));
-      const filter = u.searchParams.get('$filter') || '';
-      const pool = /Owner ne null/.test(filter) ? state.ivantiHistory || [] : state.ivantiIncidents.filter((x) => !x.Owner);
+      const pool = state.ivantiIncidents.filter((x) => !x.Owner);
       return resp(200, { value: pool.slice(skip, skip + top) });
     },
     fetchAll: (reqs) => {
@@ -308,7 +320,18 @@ function loadApp(opts) {
   const g = (name) => run(name);
   if (opts.configure !== false) {
     run(`QUERY_CONFIG.sheet.spreadsheetId = 'sheet-1'; QUERY_CONFIG.ivanti.baseUrl = 'https://ivanti.test';
-         QUERY_CONFIG.bigQuery.projectId = 'proj'; QUERY_CONFIG.bigQuery.appDataset = 'app';`);
+         QUERY_CONFIG.bigQuery.projectId = 'proj'; QUERY_CONFIG.bigQuery.appDataset = 'app';
+         QUERY_CONFIG.ivanti.employeeLookup.enabled = true; QUERY_CONFIG.ivanti.employeeLookup.idPath = 'value.0.RecId';
+         TEAMS.push({ id: 'billing', name: 'Billing Support', managers: ['pat@example.com'] });
+         TEAMS.push({ id: 'payments', name: 'Payments', managers: ['kim@example.com'] });`);
+    // Stand-in for the developer's existing lookup function: returns Ivanti-style JSON (as a string).
+    ctx.__lookup = (email) => {
+      mocks.state.lookupCalls.push(email);
+      if (mocks.state.ivantiLookupDown) throw new Error('Ivanti timeout');
+      const id = mocks.state.ivantiPeople[email];
+      return id ? JSON.stringify({ value: [{ RecId: id, PrimaryEmail: email }] }) : JSON.stringify({ value: [] });
+    };
+    run('lookupIvantiEmployee_ = function (email) { return __lookup(email); };');
     mocks.props.set('IVANTI_API_KEY', 'test-key');
     const tabs = g('REQUIRED_SHEET_TABS');
     Object.keys(tabs).forEach((name) => { mocks.sheets[name] = new mocks.MockSheet(name, Object.keys(tabs[name].columns)); });
@@ -319,21 +342,40 @@ function loadApp(opts) {
   return { run, g, mocks, ctx };
 }
 
-/** Seed a typical setup through the app's own Store (as an admin would through the UI). */
+/**
+ * Seed a typical setup through the app's own Store (as managers and admins would through the UI).
+ *  billing  (manager pat@, admin admin@): mailboxes "Billing - Special Handling" (Billing + 4000–5000) and
+ *           "General" (Category in General/Billing); employees Ana, Ben, Cy, Dee (all linked to Ivanti)
+ *  payments (manager kim@): mailbox "Card payments" (Category = Payments) and a rule-less "Payments triage"
+ *           (Vertex candidate); employees Eve, Finn
+ * Today: Ana, Ben, Cy on Billing - Special Handling; Dee on General; Eve on Card payments.
+ */
 function seed(app, today) {
   const Store = app.g('Store');
+  const st = app.mocks.state;
   const ids = {};
-  Store.mutate({ user: 'admin@example.com' }, (tx) => {
+  const emp = (tx, key, name, email) => {
+    st.ivantiPeople[email] = 'OWN-' + key.toUpperCase();
+    ids[key] = tx.insert('Employees', { employee_email: email, display_name: name, ivanti_owner_id: 'OWN-' + key.toUpperCase(), ivanti_lookup_status: 'found', active: true }).id;
+  };
+  Store.mutate({ user: 'pat@example.com', teamId: 'billing' }, (tx) => {
+    tx.insert('Admins', { email: 'admin@example.com' });
     ids.billing = tx.insert('Mailboxes', { name: 'Billing - Special Handling', description: 'IDs 4000-5000', priority: 1, active: true }).id;
     ids.general = tx.insert('Mailboxes', { name: 'General', description: '', priority: 2, active: true }).id;
-    ids.ana = tx.insert('Employees', { employee_email: 'ana@example.com', display_name: 'Ana', ivanti_owner_id: 'OWN-ANA', active: true }).id;
-    ids.ben = tx.insert('Employees', { employee_email: 'ben@example.com', display_name: 'Ben', ivanti_owner_id: 'OWN-BEN', active: true }).id;
-    ids.cy = tx.insert('Employees', { employee_email: 'cy@example.com', display_name: 'Cy', ivanti_owner_id: 'OWN-CY', active: true }).id;
-    ids.dee = tx.insert('Employees', { employee_email: 'dee@example.com', display_name: 'Dee', ivanti_owner_id: 'OWN-DEE', active: true }).id;
+    emp(tx, 'ana', 'Ana', 'ana@example.com'); emp(tx, 'ben', 'Ben', 'ben@example.com');
+    emp(tx, 'cy', 'Cy', 'cy@example.com'); emp(tx, 'dee', 'Dee', 'dee@example.com');
     tx.insert('Rules', { mailbox_id: ids.billing, conditions_json: [{ field: 'Category', op: 'equals', value: 'Billing' }, { field: 'IncidentNumber', op: 'between', value: [4000, 5000] }], active: true });
     tx.insert('Rules', { mailbox_id: ids.general, conditions_json: [{ field: 'Category', op: 'in', value: ['General', 'Billing'] }], active: true });
     ['ana', 'ben', 'cy'].forEach((k) => tx.insert('Schedule', { date: today, mailbox_id: ids.billing, employee_id: ids[k] }));
     tx.insert('Schedule', { date: today, mailbox_id: ids.general, employee_id: ids.dee });
+  });
+  Store.mutate({ user: 'kim@example.com', teamId: 'payments' }, (tx) => {
+    ids.cards = tx.insert('Mailboxes', { name: 'Card payments', description: 'Card disputes', priority: 1, active: true }).id;
+    ids.paytriage = tx.insert('Mailboxes', { name: 'Payments triage', description: 'Anything payments-related without a rule', priority: 2, active: true }).id;
+    emp(tx, 'eve', 'Eve', 'eve@example.com'); emp(tx, 'finn', 'Finn', 'finn@example.com');
+    tx.insert('Rules', { mailbox_id: ids.cards, conditions_json: [{ field: 'Category', op: 'equals', value: 'Payments' }], active: true });
+    tx.insert('Schedule', { date: today, mailbox_id: ids.cards, employee_id: ids.eve });
+    tx.insert('Schedule', { date: today, mailbox_id: ids.paytriage, employee_id: ids.finn });
   });
   return ids;
 }

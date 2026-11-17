@@ -6,15 +6,25 @@
  * employee added part-way through the day receives tickets until they have caught up.
  */
 const Balancer = {
-  /** Active, Ivanti-mapped employees scheduled today on the mailbox. */
-  scheduledEmployees(snapshot, mailboxId) {
+  /** Can this employee receive tickets? (active and linked to Ivanti) */
+  isLinked(emp) { return !!(emp && emp.active && emp.ivanti_owner_id); },
+
+  /** Active employees scheduled today on the mailbox: { linked: [ids], unlinked: [ids] }. */
+  scheduledInfo(snapshot, mailboxId) {
+    const mb = snapshot.mailboxById[mailboxId];
     const ids = {};
     snapshot.scheduleToday.forEach((e) => { if (e.mailbox_id === mailboxId) ids[e.employee_id] = true; });
-    return Object.keys(ids).filter((id) => {
+    const linked = [], unlinked = [];
+    Object.keys(ids).sort().forEach((id) => {
       const emp = snapshot.employeeById[id];
-      return emp && emp.active && emp.ivanti_owner_id;
-    }).sort();
+      if (!emp || !emp.active || (mb && emp.team_id !== mb.team_id)) return;
+      (Balancer.isLinked(emp) ? linked : unlinked).push(id);
+    });
+    return { linked: linked, unlinked: unlinked };
   },
+
+  /** Active, Ivanti-linked employees scheduled today on the mailbox. */
+  scheduledEmployees(snapshot, mailboxId) { return Balancer.scheduledInfo(snapshot, mailboxId).linked; },
 
   countKey(mailboxId, employeeId) { return mailboxId + '|' + employeeId; },
 

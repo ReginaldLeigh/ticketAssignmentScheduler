@@ -10,7 +10,10 @@ function setup() {
   const ids = seed(app, today);
   return { app, today, ids, st: app.mocks.state, A: app.mocks.bq.tables.assignments, Q: app.mocks.bq.tables.vertex_queue };
 }
-const run = (app, extra) => { app.mocks.props.delete('last_run_finished_at'); return app.g('Pipeline').run(Object.assign({ trigger: 'manual', triggeredBy: 'admin@example.com' }, extra)); };
+const run = (app, extra) => {
+  [...app.mocks.props.keys()].filter((k) => k.indexOf('last_run_finished_at') === 0).forEach((k) => app.mocks.props.delete(k));
+  return app.g('Pipeline').run(Object.assign({ teamId: 'billing', trigger: 'manual', triggeredBy: 'admin@example.com' }, extra));
+};
 const live = (A) => A.filter((a) => !a.dry_run);
 function spread(A, mailboxId) {
   const c = {};
@@ -44,7 +47,7 @@ test('priority: a Billing ticket outside 4000–5000 falls through to the Genera
 test('follow-up goes to the earlier owner even when they are not scheduled today, and is not counted', () => {
   const { app, ids, st, A } = setup();
   // History: Cy (not scheduled on General) owned an earlier ticket.
-  A.push({ ticket_id: '100', ivanti_rec_id: 'R100', subject: 'Cannot access shared drive Finance folder', mailbox_id: ids.general,
+  A.push({ ticket_id: '100', team_id: 'billing', ivanti_rec_id: 'R100', subject: 'Cannot access shared drive Finance folder', mailbox_id: ids.general,
     employee_id: ids.cy, routing_method: 'rule', counts_toward_balance: true, dry_run: false, assigned_at: '2026-10-01T12:00:00Z',
     version: 1, writeback_status: 'success', writeback_attempts: 1 });
   st.ivantiIncidents.push(incident(301, 'General', 'RE: Cannot access shared drive Finance folder'));
@@ -61,7 +64,7 @@ test('follow-up goes to the earlier owner even when they are not scheduled today
 
 test('follow-up whose owner is inactive goes through the normal split', () => {
   const { app, ids, st, A } = setup();
-  A.push({ ticket_id: '100', ivanti_rec_id: 'R100', subject: 'Cannot access shared drive Finance folder', mailbox_id: ids.general,
+  A.push({ ticket_id: '100', team_id: 'billing', ivanti_rec_id: 'R100', subject: 'Cannot access shared drive Finance folder', mailbox_id: ids.general,
     employee_id: ids.cy, routing_method: 'rule', counts_toward_balance: true, dry_run: false, assigned_at: '2026-10-01T12:00:00Z', version: 1, writeback_status: 'success', writeback_attempts: 1 });
   const cy = app.g('Store').read('Employees').find((e) => e.id === ids.cy);
   app.ctx.apiSaveEmployee({ requestId: 'x', id: cy.id, version: cy.version, display_name: cy.display_name, employee_email: cy.employee_email, ivanti_owner_id: cy.ivanti_owner_id, active: false });
@@ -84,7 +87,7 @@ test('tickets in the same run are matched with each other', () => {
 
 test('generic subjects and different numbers are not follow-ups', () => {
   const { app, st, A } = setup();
-  app.ctx.apiAddListItem({ requestId: 'ig', list: 'SubjectIgnoreList', value: 'password reset needed' });
+  assert.equal(app.ctx.apiAddListItem({ requestId: 'ig', list: 'SubjectIgnoreList', value: 'password reset needed' }).ok, true);
   st.ivantiIncidents.push(incident(4400, 'Billing', 'Password reset needed', '2026-11-16T08:00:00Z'));
   st.ivantiIncidents.push(incident(4401, 'Billing', 'RE: Password reset needed', '2026-11-16T08:01:00Z'));
   st.ivantiIncidents.push(incident(4402, 'Billing', 'Invoice 4471 charged twice', '2026-11-16T08:02:00Z'));
@@ -104,7 +107,9 @@ test('no rule match → Unrouted queue with a Vertex payload; nothing is sent to
   assert.equal(Q[0].reason, 'no_rule_match');
   const payload = JSON.parse(Q[0].payload_json);
   assert.equal(payload.subject, 'Laptop screen flickering after update');
-  assert.equal(payload.candidate_mailboxes.length, 2);
+  assert.deepEqual(payload.candidate_mailboxes.map((m) => m.name), ['Payments triage'], 'only rule-less mailboxes are Vertex candidates');
+  assert.equal(payload.candidate_mailboxes[0].team_id, 'payments');
+  assert.equal(Q[0].team_id, null, 'no team could place it: shared queue');
   assert.equal(st.fetchAllCalls.length, 0);
 });
 
@@ -214,8 +219,9 @@ test('resolve queue: admin picks a mailbox; the balancer picks the person; a sec
   const { app, ids, st, A } = setup();
   st.ivantiIncidents.push(incident(7000, 'Hardware', 'Laptop screen flickering after update'));
   run(app);
-  const q = app.ctx.apiListQueue().data[0];
+  const q = app.ctx.apiListQueue().data.shared[0];
   const r = app.ctx.apiResolveQueue({ ticketId: q.ticket_id, mailboxId: ids.billing, version: q.version });
+  assert.equal(r.data && r.data.fromShared, true);
   assert.equal(r.ok, true, JSON.stringify(r.error));
   assert.ok([ids.ana, ids.ben, ids.cy].includes(r.data.employeeId));
   assert.equal(A[0].routing_method, 'manual');
@@ -223,25 +229,10 @@ test('resolve queue: admin picks a mailbox; the balancer picks the person; a sec
   assert.equal(app.ctx.apiResolveQueue({ ticketId: q.ticket_id, mailboxId: ids.billing, version: q.version }).ok, false);
 });
 
-test('backfill loads past Ivanti tickets as history only (rows added, no tables created)', () => {
-  const { app, ids, st, A } = setup();
-  st.ivantiHistory = [Object.assign(incident(50, 'General', 'Printer on floor 3 keeps jamming'), { Owner: 'OWN-BEN' }),
-    Object.assign(incident(51, 'General', 'Unknown owner ticket subject here'), { Owner: 'SOMEONE-ELSE' })];
-  const res = app.run("backfillHistoryFromIvanti('2026-01-01')");
-  assert.equal(res.loaded, 1);
-  assert.equal(res.skippedNoOwnerMatch, 1);
-  assert.equal(A[0].routing_method, 'backfill');
-  assert.equal(A[0].counts_toward_balance, false);
-  assert.equal(A[0].writeback_status, 'not_applicable');
-  st.ivantiIncidents.push(incident(4100, 'Billing', 'RE: Printer on floor 3 keeps jamming'));
-  run(app);
-  assert.equal(live(A).find((a) => a.ticket_id === '4100').employee_id, ids.ben, 'history drives follow-ups');
-  assert.deepEqual(st.creationCalls, []);
-});
 
 test('test-a-subject shows matches and whether they pass the threshold', () => {
   const { app, ids, A } = setup();
-  A.push({ ticket_id: '100', ivanti_rec_id: 'R100', subject: 'VPN keeps disconnecting at home', mailbox_id: ids.general, employee_id: ids.cy,
+  A.push({ ticket_id: '100', team_id: 'billing', ivanti_rec_id: 'R100', subject: 'VPN keeps disconnecting at home', mailbox_id: ids.general, employee_id: ids.cy,
     routing_method: 'rule', counts_toward_balance: true, dry_run: false, assigned_at: '2026-10-01T12:00:00Z', version: 1, writeback_status: 'success', writeback_attempts: 1 });
   const r = app.ctx.apiTestSubject({ subject: 'RE: VPN keeps disconnecting at home' }).data;
   assert.equal(r.eligible, true);

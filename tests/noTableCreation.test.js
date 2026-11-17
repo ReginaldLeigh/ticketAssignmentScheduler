@@ -17,6 +17,20 @@ function sourceFiles(dir) {
   });
 }
 
+/**
+ * Logical source files. In the single-file build (dist/Code.gs) each original file sits under a
+ * banner like  /* ═══ BigQuery.gs ═══ *\/ , so it is split back into its sections here.
+ */
+function sourceUnits(dir) {
+  return sourceFiles(dir).flatMap((f) => {
+    const text = fs.readFileSync(f, 'utf8');
+    const re = /^\/\* ═+ ([\w.]+\.gs) ═+ \*\/$/gm;
+    const marks = [...text.matchAll(re)];
+    if (!marks.length) return [{ name: path.basename(f), text }];
+    return marks.map((m, i) => ({ name: m[1], text: text.slice(m.index, i + 1 < marks.length ? marks[i + 1].index : text.length) }));
+  });
+}
+
 const FORBIDDEN = [
   [/\bCREATE\s+(OR\s+REPLACE\s+)?(TEMP(ORARY)?\s+)?(TABLE|SCHEMA|VIEW|MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE|SNAPSHOT\s+TABLE|FUNCTION|DATASET)\b/i, 'CREATE … TABLE/SCHEMA/VIEW'],
   [/\bCREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b/i, 'CREATE TABLE IF NOT EXISTS'],
@@ -43,7 +57,7 @@ const FORBIDDEN = [
 
 test('source scan: no file contains table-creation code', () => {
   const files = sourceFiles(SRC);
-  assert.ok(files.length > 10, 'source files found');
+  assert.ok(sourceUnits(SRC).length > 10, 'source files (or sections of the single-file build) found');
   const hits = [];
   files.forEach((f) => {
     const text = fs.readFileSync(f, 'utf8');
@@ -69,20 +83,23 @@ test('source scan: no setup script that creates tables exists', () => {
 
 test('source scan: only BigQuery.gs uses the BigQuery service, and only read/query methods', () => {
   const allowed = new Set(['BigQuery.Jobs.query', 'BigQuery.Jobs.getQueryResults', 'BigQuery.Tables.get']);
-  sourceFiles(SRC).forEach((f) => {
-    const text = fs.readFileSync(f, 'utf8');
+  const units = sourceUnits(SRC);
+  assert.ok(units.some((u) => u.name === 'BigQuery.gs'), 'BigQuery.gs section found');
+  units.forEach(({ name, text }) => {
     // Service members are capitalised (BigQuery.Jobs…, BigQuery.Tables…); "BigQuery.gs" in comments is a file name.
     const uses = text.match(/\bBigQuery\.[A-Z][A-Za-z]*(\.[A-Za-z]+)?/g) || [];
-    if (path.basename(f) !== 'BigQuery.gs') assert.deepEqual(uses, [], path.basename(f) + ' must not call the BigQuery service directly');
+    if (name !== 'BigQuery.gs') assert.deepEqual(uses, [], name + ' must not call the BigQuery service directly');
     else uses.forEach((u) => assert.ok(allowed.has(u), 'BigQuery.gs uses a non-allowed method: ' + u));
-    assert.doesNotMatch(text, /=\s*BigQuery\s*[;,)]/, path.basename(f) + ' must not alias the BigQuery service');
+    assert.doesNotMatch(text, /=\s*BigQuery\s*[;,)]/, name + ' must not alias the BigQuery service');
   });
 });
 
 test('source scan: only Store.gs uses SpreadsheetApp', () => {
-  sourceFiles(SRC).forEach((f) => {
-    if (path.basename(f) === 'Store.gs') return;
-    assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /\bSpreadsheetApp\b/, path.basename(f) + ' must not use SpreadsheetApp');
+  const units = sourceUnits(SRC);
+  assert.ok(units.some((u) => u.name === 'Store.gs'), 'Store.gs section found');
+  units.forEach(({ name, text }) => {
+    if (name === 'Store.gs') return;
+    assert.doesNotMatch(text, /\bSpreadsheetApp\b/, name + ' must not use SpreadsheetApp');
   });
 });
 
@@ -159,21 +176,24 @@ test('whole app: a full day of use makes zero creation calls', () => {
   const run = (c) => app.run(c);
   // Schema check, dry run, live run, a second run, UI actions through the web-app API.
   app.g('SchemaCheck').checkAll();
-  app.g('Pipeline').run({ trigger: 'manual', triggeredBy: 'admin@example.com', dryRun: true });
-  app.g('Pipeline').run({ trigger: 'scheduled', triggeredBy: 'system' });
-  app.mocks.props.delete('last_run_finished_at');
-  app.g('Pipeline').run({ trigger: 'manual', triggeredBy: 'admin@example.com' });
+  app.g('Pipeline').run({ teamId: 'billing', trigger: 'manual', triggeredBy: 'admin@example.com', dryRun: true });
+  app.g('Pipeline').run({ teamId: 'billing', trigger: 'scheduled', triggeredBy: 'system' });
+  app.g('Pipeline').run({ teamId: 'payments', trigger: 'scheduled', triggeredBy: 'system' });
+  app.mocks.props.delete('last_run_finished_at:billing');
+  app.g('Pipeline').run({ teamId: 'billing', trigger: 'manual', triggeredBy: 'admin@example.com' });
   const ok = (r) => { assert.equal(r.ok, true, JSON.stringify(r.error)); return r.data; };
   ok(run('apiBootstrap()'));
   ok(app.ctx.apiScheduleAdd({ requestId: 'r1', date: today, mailboxId: ids.general, employeeId: ids.ana }));
   ok(app.ctx.apiScheduleCopyWeek({ requestId: 'r2', fromStart: today, toStart: '2030-01-07' }));
   ok(app.ctx.apiSaveMailbox({ requestId: 'r3', name: 'New box', description: '' }));
   ok(app.ctx.apiAddListItem({ requestId: 'r4', list: 'StopWords', value: 'urgent' }));
-  ok(app.ctx.apiSaveSetting({ requestId: 'r5', key: 'SUBJECT_MATCH_THRESHOLD', value: '0.8' }));
+  ok(app.ctx.apiSaveTeamSetting({ requestId: 'r5', key: 'RUN_TIMES', value: '07:00,14:00' }));
+  ok(app.ctx.apiScheduleRange({ requestId: 'r6', employeeId: ids.ana, mailboxId: ids.general, from: '2030-02-04', to: '2030-02-15', days: ['MON', 'TUE', 'WED', 'THU', 'FRI'] }));
+  ok(app.ctx.apiSaveEmployee({ requestId: 'r7', display_name: 'Gus', employee_email: 'gus@example.com' }));
   ok(app.ctx.apiTestSubject({ subject: 'Question about invoice 701 late fee' }));
   const q = ok(app.ctx.apiListQueue());
-  assert.ok(q.length > 0);
-  ok(app.ctx.apiResolveQueue({ ticketId: q[0].ticket_id, mailboxId: ids.billing, employeeId: null, version: q[0].version }));
+  assert.ok(q.shared.length > 0);
+  ok(app.ctx.apiResolveQueue({ ticketId: q.shared[0].ticket_id, mailboxId: ids.billing, employeeId: null, version: q.shared[0].version }));
   const row = app.mocks.bq.tables.assignments.find((a) => !a.dry_run && a.routing_method === 'rule');
   ok(app.ctx.apiReassign({ ticketId: row.ticket_id, employeeId: ids.ben === row.employee_id ? ids.cy : ids.ben, version: row.version }));
   ok(app.ctx.apiRunStatus());
@@ -192,7 +212,7 @@ test('missing BigQuery table: run stops, names the table, and creates nothing', 
   seed(app, app.g('Config').today());
   app.mocks.bq.exists.runs = false;
   app.mocks.state.ivantiIncidents.push(incident(4100, 'Billing', 'Invoice 5 charged twice'));
-  const r = app.g('Pipeline').run({ trigger: 'manual', triggeredBy: 'admin@example.com' });
+  const r = app.g('Pipeline').run({ teamId: 'billing', trigger: 'manual', triggeredBy: 'admin@example.com' });
   assert.equal(r.status, 'stopped_check_failed');
   assert.ok(r.errors.some((e) => /runs/.test(e) && /does not exist/.test(e)), r.errors.join(' | '));
   assert.deepEqual(app.mocks.state.creationCalls, []);

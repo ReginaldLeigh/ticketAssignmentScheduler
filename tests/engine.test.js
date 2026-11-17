@@ -39,17 +39,19 @@ test('rules: validation rejects bad input with clear messages', () => {
   assert.deepEqual(plain(Rules.validate([{ field: 'S', op: 'in', value: 'a, b ,,c' }])[0].value), ['a', 'b', 'c']);
 });
 
-test('rules: mailboxes are checked in priority order; first match wins; AND within a rule', () => {
+test('rules: teams in TEAMS order, then mailbox priority; first match wins; AND within a rule; rule-less mailboxes skipped', () => {
   const snap = {
-    mailboxes: [{ id: 'm1', priority: 1 }, { id: 'm2', priority: 2 }],
-    rules: [
-      { id: 'r2', mailbox_id: 'm2', version: 1, conditions_json: [{ field: 'Category', op: 'equals', value: 'Billing' }] },
-      { id: 'r1', mailbox_id: 'm1', version: 3, conditions_json: [{ field: 'Category', op: 'equals', value: 'Billing' }, { field: 'IncidentNumber', op: 'between', value: [4000, 5000] }] },
-    ],
+    teams: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }],
+    byTeam: { a: { mailboxes: [{ id: 'a1', team_id: 'a' }, { id: 'a2', team_id: 'a' }] }, b: { mailboxes: [{ id: 'b1', team_id: 'b' }, { id: 'b2', team_id: 'b' }] } },
+    rulesByMailbox: {
+      a1: [{ id: 'r1', mailbox_id: 'a1', version: 3, conditions_json: [{ field: 'Category', op: 'equals', value: 'Billing' }, { field: 'IncidentNumber', op: 'between', value: [4000, 5000] }] }],
+      b1: [{ id: 'r2', mailbox_id: 'b1', version: 1, conditions_json: [{ field: 'Category', op: 'equals', value: 'Billing' }] }],
+    },
   };
-  assert.deepEqual(plain(Rules.route(t({ Category: 'Billing', IncidentNumber: 4200 }), snap)), { mailboxId: 'm1', ruleId: 'r1', ruleVersion: 3 });
-  assert.equal(Rules.route(t({ Category: 'Billing', IncidentNumber: 9000 }), snap).mailboxId, 'm2');
+  assert.deepEqual(plain(Rules.route(t({ Category: 'Billing', IncidentNumber: 4200 }), snap)), { teamId: 'a', mailboxId: 'a1', ruleId: 'r1', ruleVersion: 3 });
+  assert.equal(Rules.route(t({ Category: 'Billing', IncidentNumber: 9000 }), snap).teamId, 'b', 'falls through to the next team');
   assert.equal(Rules.route(t({ Category: 'Hardware' }), snap), null);
+  assert.deepEqual(plain(Rules.ruleless(snap).map((c) => c.mailbox.id)), ['a2', 'b2']);
 });
 
 /* ───────────── Subject matching ───────────── */
@@ -124,12 +126,14 @@ test('balancer: someone added mid-day catches up before others get more', () => 
 
 test('balancer: nobody scheduled → null', () => { assert.equal(Balancer.pick('mb', [], {}), null); });
 
-test('balancer: only active, Ivanti-mapped employees scheduled on that mailbox count', () => {
+test('balancer: only active, Ivanti-linked employees of the mailbox\'s team count; unlinked ones are reported', () => {
   const snap = {
-    scheduleToday: [{ mailbox_id: 'm', employee_id: 'a' }, { mailbox_id: 'm', employee_id: 'b' }, { mailbox_id: 'm', employee_id: 'c' }, { mailbox_id: 'x', employee_id: 'd' }],
-    employeeById: { a: { active: true, ivanti_owner_id: '1' }, b: { active: false, ivanti_owner_id: '2' }, c: { active: true, ivanti_owner_id: '' }, d: { active: true, ivanti_owner_id: '4' } },
+    mailboxById: { m: { id: 'm', team_id: 't' } },
+    scheduleToday: [{ mailbox_id: 'm', employee_id: 'a' }, { mailbox_id: 'm', employee_id: 'b' }, { mailbox_id: 'm', employee_id: 'c' }, { mailbox_id: 'x', employee_id: 'd' }, { mailbox_id: 'm', employee_id: 'e' }],
+    employeeById: { a: { active: true, ivanti_owner_id: '1', team_id: 't' }, b: { active: false, ivanti_owner_id: '2', team_id: 't' },
+      c: { active: true, ivanti_owner_id: '', team_id: 't' }, d: { active: true, ivanti_owner_id: '4', team_id: 't' }, e: { active: true, ivanti_owner_id: '5', team_id: 'other' } },
   };
-  assert.deepEqual(plain(Balancer.scheduledEmployees(snap, 'm')), ['a']);
+  assert.deepEqual(plain(Balancer.scheduledInfo(snap, 'm')), { linked: ['a'], unlinked: ['c'] });
 });
 
 void formatDate;

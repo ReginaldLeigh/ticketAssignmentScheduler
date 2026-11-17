@@ -1,9 +1,9 @@
 /**
- * FollowUp.gs — finds follow-ups (D2, D3, D9, D24).
+ * FollowUp.gs — finds follow-ups (D2, D3, D9, D24), always within ONE team's history (A4).
  * A new ticket is a follow-up when its cleaned subject scores at or above the threshold against
- * an earlier ticket in the ticket history (BigQuery, default = the assignments table). The best
- * score wins; a tie goes to the most recent earlier ticket. Tickets in the same run are also
- * compared with each other (in JavaScript, using the same scoring).
+ * an earlier ticket of that team. The best score wins; a tie goes to the most recent earlier
+ * ticket. Tickets handled earlier in the same run are compared too (in JavaScript, same scoring).
+ * Each team's own stop words and ignore list apply.
  */
 const FollowUp = {
   historyConfig_() {
@@ -17,77 +17,83 @@ const FollowUp = {
     };
   },
 
-  /** Map an owner value from the history table to an Employees.id. */
-  ownerToEmployeeId_(owner, ownerColumnType, snapshot) {
+  /** Map an owner value from the history table to an Employees.id of the given team. */
+  ownerToEmployeeId_(owner, ownerColumnType, snapshot, teamId) {
     if (!owner) return null;
-    if (ownerColumnType === 'ivanti_owner_id') {
-      const emp = snapshot.employees.find((e) => String(e.ivanti_owner_id) === String(owner));
-      return emp ? emp.id : null;
-    }
-    return snapshot.employeeById[owner] ? owner : null;
+    let emp;
+    if (ownerColumnType === 'ivanti_owner_id') emp = snapshot.employees.find((e) => String(e.ivanti_owner_id) === String(owner) && e.team_id === teamId);
+    else emp = snapshot.employeeById[owner];
+    return emp && emp.team_id === teamId ? emp.id : null;
+  },
+
+  teamCtx_(snapshot, teamId) {
+    const t = snapshot.byTeam[teamId] || { stopWords: DEFAULT_STOP_WORDS, ignoreList: [] };
+    return { stopWords: t.stopWords, ignoreList: t.ignoreList, threshold: snapshot.dev.SUBJECT_MATCH_THRESHOLD, minWords: snapshot.dev.SUBJECT_MIN_WORDS };
   },
 
   /**
-   * tickets: [{ ticketId, subject }]. Returns { ticketId: { matchedTicketId, employeeId, mailboxId, score } }
-   * for tickets whose best history match is at or above the threshold.
+   * tickets: [{ ticketId, subject }]. Compares them with ONE team's history.
+   * Returns { ticketId: { matchedTicketId, employeeId, mailboxId, teamId, score } }.
+   * opts.limitPerTicket > 1 returns arrays (used by "Test a subject"); opts.threshold overrides.
    */
-  findInHistory(tickets, snapshot, limitPerTicket) {
-    const s = snapshot.settings;
+  findInHistory(tickets, snapshot, teamId, opts) {
+    opts = opts || {};
+    const c = FollowUp.teamCtx_(snapshot, teamId);
     const eligible = tickets
-      .filter((t) => Subject.isEligible(t.subject, snapshot.stopWords, s.SUBJECT_MIN_WORDS, snapshot.ignoreList))
-      .map((t) => ({ ticket_id: String(t.ticketId), seq: Subject.seq(t.subject, snapshot.stopWords) }));
+      .filter((t) => Subject.isEligible(t.subject, c.stopWords, c.minWords, c.ignoreList))
+      .map((t) => ({ ticket_id: String(t.ticketId), seq: Subject.seq(t.subject, c.stopWords) }));
     if (!eligible.length) return {};
     const hc = FollowUp.historyConfig_();
     const res = BQ.query(SQL.historyMatch(hc.ref.sql, hc.columns), [
       BQ.p.structArray('new_tickets', [['ticket_id', 'STRING'], ['seq', 'STRING']], eligible),
-      BQ.p.stringArray('stop_words', snapshot.stopWords),
+      BQ.p.string('team_id', teamId),
+      BQ.p.stringArray('stop_words', c.stopWords),
       BQ.p.string('prefix_pattern', QUERY_CONFIG.subjectMatching.prefixPattern),
-      BQ.p.float64('threshold', s.SUBJECT_MATCH_THRESHOLD),
-      BQ.p.int64('min_words', s.SUBJECT_MIN_WORDS),
-      BQ.p.int64('limit_per_ticket', limitPerTicket || 1),
+      BQ.p.float64('threshold', opts.threshold !== undefined ? opts.threshold : c.threshold),
+      BQ.p.int64('min_words', c.minWords),
+      BQ.p.int64('limit_per_ticket', opts.limitPerTicket || 1),
     ]);
     const out = {};
     res.rows.forEach((r) => {
-      const employeeId = FollowUp.ownerToEmployeeId_(r.owner, hc.ownerColumnType, snapshot);
-      const m = { matchedTicketId: r.matched_ticket_id, employeeId: employeeId, rawOwner: r.owner,
+      const employeeId = FollowUp.ownerToEmployeeId_(r.owner, hc.ownerColumnType, snapshot, teamId);
+      const m = { matchedTicketId: r.matched_ticket_id, employeeId: employeeId, rawOwner: r.owner, teamId: teamId,
         mailboxId: r.mailbox_id || null, score: Number(r.score), matchedAt: r.matched_at };
-      if (limitPerTicket && limitPerTicket > 1) (out[r.ticket_id] = out[r.ticket_id] || []).push(m);
+      if (opts.limitPerTicket && opts.limitPerTicket > 1) (out[r.ticket_id] = out[r.ticket_id] || []).push(m);
       else if (!out[r.ticket_id]) out[r.ticket_id] = m;
     });
     return out;
   },
 
-  /** Compare a ticket with tickets already handled in this run (same scoring as SQL). */
-  findInBatch(ticket, batch, snapshot) {
-    const s = snapshot.settings;
-    if (!Subject.isEligible(ticket.subject, snapshot.stopWords, s.SUBJECT_MIN_WORDS, snapshot.ignoreList)) return null;
-    const seq = Subject.seq(ticket.subject, snapshot.stopWords);
+  /** Compare a ticket with tickets of `teamId` handled earlier in this run (same scoring as SQL). */
+  findInBatch(ticket, batch, snapshot, teamId) {
+    const c = FollowUp.teamCtx_(snapshot, teamId);
+    if (!Subject.isEligible(ticket.subject, c.stopWords, c.minWords, c.ignoreList)) return null;
+    const seq = Subject.seq(ticket.subject, c.stopWords);
     let best = null;
     batch.forEach((b) => {
-      if (!b.employeeId || b.ticketId === ticket.ticketId) return;
-      const score = Subject.score(seq, Subject.seq(b.subject, snapshot.stopWords), s.SUBJECT_MIN_WORDS);
-      if (score >= s.SUBJECT_MATCH_THRESHOLD && (!best || score >= best.score)) {
-        best = { matchedTicketId: b.ticketId, employeeId: b.employeeId, mailboxId: b.mailboxId, score: score };
+      if (b.teamId !== teamId || !b.employeeId || b.ticketId === ticket.ticketId) return;
+      const score = Subject.score(seq, Subject.seq(b.subject, c.stopWords), c.minWords);
+      if (score >= c.threshold && (!best || score >= best.score)) {
+        best = { matchedTicketId: b.ticketId, employeeId: b.employeeId, mailboxId: b.mailboxId, teamId: teamId, score: score };
       }
     });
     return best;
   },
 
-  /** Settings page "Test a subject": top 5 history matches with scores. */
-  testSubject(subject) {
+  /** Team settings page "Test a subject": top 5 matches in the caller's team, with scores. */
+  testSubject(subject, teamId) {
     const snapshot = Config.snapshot();
-    const s = snapshot.settings;
-    const seq = Subject.seq(subject, snapshot.stopWords);
-    const eligible = Subject.isEligible(subject, snapshot.stopWords, s.SUBJECT_MIN_WORDS, snapshot.ignoreList);
-    const result = { cleaned: seq, eligible: eligible, threshold: s.SUBJECT_MATCH_THRESHOLD, matches: [] };
+    const c = FollowUp.teamCtx_(snapshot, teamId);
+    const seq = Subject.seq(subject, c.stopWords);
+    const eligible = Subject.isEligible(subject, c.stopWords, c.minWords, c.ignoreList);
+    const result = { cleaned: seq, eligible: eligible, threshold: c.threshold, matches: [] };
     if (!eligible) return result;
-    const saved = s.SUBJECT_MATCH_THRESHOLD;
-    snapshot.settings = Object.assign({}, s, { SUBJECT_MATCH_THRESHOLD: Math.min(saved, 0.3) });
-    const found = FollowUp.findInHistory([{ ticketId: '__test__', subject: subject }], snapshot, 5);
+    const found = FollowUp.findInHistory([{ ticketId: '__test__', subject: subject }], snapshot, teamId,
+      { limitPerTicket: 5, threshold: Math.min(c.threshold, 0.3) });
     result.matches = (found.__test__ || []).map((m) => {
       const emp = m.employeeId ? snapshot.employeeById[m.employeeId] : null;
-      return { ticketId: m.matchedTicketId, score: Math.round(m.score * 100) / 100, wouldMatch: m.score >= saved,
-        owner: emp ? emp.display_name : (m.rawOwner || ''), matchedAt: m.matchedAt };
+      return { ticketId: m.matchedTicketId, score: Math.round(m.score * 100) / 100, wouldMatch: m.score >= c.threshold,
+        owner: emp ? emp.display_name : '', matchedAt: m.matchedAt };
     });
     return result;
   },

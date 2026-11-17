@@ -21,7 +21,7 @@ const Lease = {
   },
 
   /**
-   * info: { runId, startedBy, trigger, takeOverRunId }. A continuation passes the earlier run's id
+   * info: { runId, startedBy, trigger, teamId, takeOverRunId }. One run at a time across the app. A continuation passes the earlier run's id
    * in takeOverRunId to inherit its lease. Returns { acquired, lease } or { acquired: false, current }.
    */
   acquire(info) {
@@ -31,7 +31,7 @@ const Lease = {
         return { acquired: false, current: cur };
       }
       const lease = {
-        runId: info.runId, startedBy: info.startedBy, trigger: info.trigger,
+        runId: info.runId, startedBy: info.startedBy, trigger: info.trigger, teamId: info.teamId || null,
         startedAt: new Date().toISOString(),
         expiresAt: new Date(Date.now() + LEASE_TTL_MS).toISOString(),
       };
@@ -50,22 +50,23 @@ const Lease = {
     });
   },
 
-  release(runId, finished) {
+  /** Releases the lease; `teamId` records when that team's run finished (for its Run now cooldown). */
+  release(runId, finished, teamId) {
     return Store.withLock(() => {
       const props = PropertiesService.getScriptProperties();
       const cur = Lease.current();
       if (cur && cur.runId === runId) props.deleteProperty(LEASE_KEY);
-      if (finished) props.setProperty(LAST_FINISHED_KEY, new Date().toISOString());
+      if (finished) props.setProperty(LAST_FINISHED_KEY + ':' + (teamId || '_'), new Date().toISOString());
     });
   },
 
-  lastFinishedAt() {
-    return PropertiesService.getScriptProperties().getProperty(LAST_FINISHED_KEY);
+  lastFinishedAt(teamId) {
+    return PropertiesService.getScriptProperties().getProperty(LAST_FINISHED_KEY + ':' + (teamId || '_'));
   },
 
-  /** Minutes left in the Run now cooldown (0 = can run). */
-  cooldownRemainingMin(cooldownMin) {
-    const last = Lease.lastFinishedAt();
+  /** Minutes left in a team's Run now cooldown (0 = can run). */
+  cooldownRemainingMin(cooldownMin, teamId) {
+    const last = Lease.lastFinishedAt(teamId);
     if (!last || !cooldownMin) return 0;
     const left = Date.parse(last) + cooldownMin * 60000 - Date.now();
     return left > 0 ? Math.ceil(left / 60000) : 0;

@@ -1,5 +1,6 @@
 /**
- * Triggers.gs — automatic runs at RUN_TIMES on RUN_DAYS (default 06:00 and 13:00, Mon–Fri).
+ * Triggers.gs — automatic runs for each team at its own RUN_TIMES on its RUN_DAYS (Team settings;
+ * default 06:00 and 13:00, Mon–Fri).
  *
  * Apps Script's daily triggers only promise to fire somewhere within the chosen hour, so a small
  * "ticker" runs every 10 minutes instead, and starts a run when a time slot is due and has not
@@ -42,22 +43,30 @@ const Triggers = {
     return slot;
   },
 
+  /** Runs every team whose slot is due, one after another. Returns { status, runs: [summary] }. */
   tick(now) {
-    let settings;
-    try { settings = Config.settings(); } catch (e) {
-      settings = {}; Object.keys(DEFAULT_SETTINGS).forEach((k) => { settings[k] = DEFAULT_SETTINGS[k].value; });
-    }
     const props = PropertiesService.getScriptProperties();
-    const slot = Triggers.dueSlot(now || new Date(), settings, props.getProperty(LAST_SLOT_KEY), Store.tz_());
-    if (!slot) return { status: 'idle' };
-    const res = Pipeline.run({ trigger: 'scheduled', triggeredBy: 'system', runSlot: slot });
-    if (res.status !== 'busy') props.setProperty(LAST_SLOT_KEY, slot);
-    return res;
+    const runs = [];
+    for (let i = 0; i < TEAMS.length; i++) {
+      const team = TEAMS[i];
+      let settings;
+      try { settings = Config.settings(team.id); } catch (e) {
+        settings = {}; Object.keys(TEAM_SETTING_DEFS).forEach((k) => { settings[k] = TEAM_SETTING_DEFS[k].value; });
+      }
+      const key = LAST_SLOT_KEY + ':' + team.id;
+      const slot = Triggers.dueSlot(now || new Date(), settings, props.getProperty(key), Store.tz_());
+      if (!slot) continue;
+      const res = Pipeline.run({ teamId: team.id, trigger: 'scheduled', triggeredBy: 'system', runSlot: slot });
+      if (res.status !== 'busy') props.setProperty(key, slot);
+      runs.push(res);
+      if (res.status === 'busy' || res.status === 'continued') break;   // try the rest on the next tick
+    }
+    return { status: runs.length ? 'ran' : 'idle', runs: runs };
   },
 
   scheduleContinuation(runId, opts) {
     PropertiesService.getScriptProperties().setProperty(CONTINUATION_KEY, JSON.stringify({
-      continuationOf: runId, triggeredBy: opts.triggeredBy || 'system', dryRun: !!opts.dryRun, runSlot: opts.runSlot || null }));
+      continuationOf: runId, teamId: opts.teamId, triggeredBy: opts.triggeredBy || 'system', dryRun: !!opts.dryRun, runSlot: opts.runSlot || null }));
     ScriptApp.newTrigger(CONTINUE_HANDLER).timeBased().after(60 * 1000).create();
   },
 
@@ -68,7 +77,7 @@ const Triggers = {
     props.deleteProperty(CONTINUATION_KEY);
     if (!raw) return { status: 'idle' };
     const c = JSON.parse(raw);
-    return Pipeline.run({ trigger: 'continuation', triggeredBy: c.triggeredBy, dryRun: c.dryRun, runSlot: c.runSlot, continuationOf: c.continuationOf });
+    return Pipeline.run({ teamId: c.teamId, trigger: 'continuation', triggeredBy: c.triggeredBy, dryRun: c.dryRun, runSlot: c.runSlot, continuationOf: c.continuationOf });
   },
 
   install() {
@@ -84,6 +93,6 @@ const Triggers = {
 
   status() {
     const handlers = ScriptApp.getProjectTriggers().map((t) => t.getHandlerFunction());
-    return { tickerInstalled: handlers.indexOf(TICKER_HANDLER) !== -1, lastSlot: PropertiesService.getScriptProperties().getProperty(LAST_SLOT_KEY) };
+    return { tickerInstalled: handlers.indexOf(TICKER_HANDLER) !== -1 };
   },
 };

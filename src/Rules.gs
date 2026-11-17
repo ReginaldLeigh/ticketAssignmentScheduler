@@ -80,17 +80,33 @@ const Rules = {
     return Array.isArray(conditions) && conditions.length > 0 && conditions.every((c) => Rules.evaluateCondition(c, ticket));
   },
 
-  /** First matching mailbox in priority order: { mailboxId, ruleId, ruleVersion } or null. */
+  /**
+   * First match: teams in TEAMS order (A8), then each team's mailboxes by priority, then rules.
+   * Only mailboxes WITH rules take part; rule-less mailboxes are Vertex candidates (A3).
+   * Returns { teamId, mailboxId, ruleId, ruleVersion } or null.
+   */
   route(ticket, snapshot) {
-    for (let i = 0; i < snapshot.mailboxes.length; i++) {
-      const mb = snapshot.mailboxes[i];
-      const rules = snapshot.rules.filter((r) => r.mailbox_id === mb.id);
-      for (let j = 0; j < rules.length; j++) {
-        if (Rules.matches(rules[j].conditions_json, ticket)) {
-          return { mailboxId: mb.id, ruleId: rules[j].id, ruleVersion: rules[j].version };
+    for (let t = 0; t < snapshot.teams.length; t++) {
+      const teamId = snapshot.teams[t].id;
+      const mailboxes = (snapshot.byTeam[teamId] || { mailboxes: [] }).mailboxes;
+      for (let i = 0; i < mailboxes.length; i++) {
+        const rules = snapshot.rulesByMailbox[mailboxes[i].id] || [];
+        for (let j = 0; j < rules.length; j++) {
+          if (Rules.matches(rules[j].conditions_json, ticket)) {
+            return { teamId: teamId, mailboxId: mailboxes[i].id, ruleId: rules[j].id, ruleVersion: rules[j].version };
+          }
         }
       }
     }
     return null;
+  },
+
+  /** Active mailboxes with no active rules, across all teams, in TEAMS order (Vertex candidates). */
+  ruleless(snapshot) {
+    const out = [];
+    snapshot.teams.forEach((t) => (snapshot.byTeam[t.id] || { mailboxes: [] }).mailboxes.forEach((m) => {
+      if (!(snapshot.rulesByMailbox[m.id] || []).length) out.push({ mailbox: m, teamId: t.id, teamName: t.name });
+    }));
+    return out;
   },
 };

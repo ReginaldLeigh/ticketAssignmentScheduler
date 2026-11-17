@@ -143,7 +143,7 @@ test('every save writes an audit row and bumps the revision other pages poll', (
   app.ctx.apiScheduleAdd({ requestId: 'au', date: '2030-01-08', mailboxId: ids.billing, employeeId: ids.ben });
   assert.equal(app.ctx.apiPoll().data.revisions.Schedule, revBefore + 1);
   assert.equal(app.mocks.sheets.AuditLog.data.length, auditBefore + 1);
-  as(app, 'other@example.com');
+  as(app, 'pat@example.com');   // the team's manager sees the admin's change
   const notes = app.ctx.apiGetChanges({ since: '' }).data.notes;
   assert.ok(notes.some((n) => /admin added Ben to Billing/.test(n)), notes.join(' | '));
 });
@@ -151,37 +151,54 @@ test('every save writes an audit row and bumps the revision other pages poll', (
 test('user text that looks like a formula is stored as text', () => {
   const { app } = setup();
   app.ctx.apiSaveMailbox({ requestId: 'f1', name: '=IMPORTRANGE("x")', description: '+1' });
-  const raw = app.mocks.sheets.Mailboxes.data.find((r) => String(r[1]).indexOf('IMPORTRANGE') !== -1);
-  assert.equal(raw[1], '=IMPORTRANGE("x")', 'mock Sheets strips the protective apostrophe, as real Sheets does');
+  const nameCol = app.mocks.sheets.Mailboxes.data[0].indexOf('name');
+  const raw = app.mocks.sheets.Mailboxes.data.find((r) => String(r[nameCol]).indexOf('IMPORTRANGE') !== -1);
+  assert.equal(raw[nameCol], '=IMPORTRANGE("x")', 'mock Sheets strips the protective apostrophe, as real Sheets does');
   assert.equal(app.g('Store').read('Mailboxes').find((m) => /IMPORTRANGE/.test(m.name)).name, '=IMPORTRANGE("x")');
 });
 
 /* ───────────── Roles ───────────── */
-test('viewers can view and use Run now, but cannot change anything', () => {
+test('employees can view their team and use Run now, but cannot change anything', () => {
   const { app, ids } = setup();
-  app.g('Store').mutate({ user: 'admin@example.com' }, (tx) => tx.insert('Admins', { email: 'admin@example.com' }));
-  as(app, 'viewer@example.com');
-  assert.equal(app.ctx.apiBootstrap().data.isAdmin, false);
+  as(app, 'ana@example.com');
+  const boot = app.ctx.apiBootstrap().data;
+  assert.equal(boot.role, 'employee');
+  assert.equal(boot.isAdmin, false);
+  assert.equal(boot.team.name, 'Billing Support');
   assert.equal(app.ctx.apiGetWeek({ weekStart: '2030-01-07' }).ok, true);
-  assert.equal(app.ctx.apiBootstrap().data.employees[0].ivanti_owner_id, undefined, 'viewers do not receive owner ids');
-  ['apiScheduleAdd', 'apiSaveMailbox', 'apiSaveRule', 'apiSaveEmployee', 'apiSaveSetting', 'apiAddListItem', 'apiListQueue', 'apiSearchAssignments']
-    .forEach((fn) => assert.equal(app.ctx[fn]({ requestId: 'v', date: '2030-01-07', mailboxId: ids.billing, employeeId: ids.ana, name: 'x', key: 'RUN_TIMES', value: '06:00', list: 'Admins' }).error.type, 'PermissionError', fn));
-  assert.equal(app.ctx.apiRunNow({}).ok, true, 'anyone can Run now');
-  assert.equal(app.ctx.apiRunNow({ dryRun: true }).error.type, 'PermissionError', 'dry run is admin-only');
+  assert.equal(boot.employees[0].employee_email, undefined, 'employees see names only');
+  ['apiScheduleAdd', 'apiScheduleRange', 'apiSaveMailbox', 'apiSaveRule', 'apiSaveEmployee', 'apiSaveTeamSetting', 'apiAddListItem', 'apiListQueue',
+    'apiSearchAssignments', 'apiGetTeamSettings', 'apiGetAudit']
+    .forEach((fn) => assert.equal(app.ctx[fn]({ requestId: 'v', date: '2030-01-07', from: '2030-01-07', to: '2030-01-08', days: ['MON'], mailboxId: ids.billing,
+      employeeId: ids.ana, name: 'x', key: 'RUN_TIMES', value: '06:00', list: 'StopWords', display_name: 'x', employee_email: 'x@example.com' }).error.type, 'PermissionError', fn));
+  assert.equal(app.ctx.apiRunNow({}).ok, true, 'every role can Run now');
+  assert.equal(app.ctx.apiRunNow({ dryRun: true }).error.type, 'PermissionError', 'dry run is for managers and admins');
 });
 
-test('a user outside the domain (no email) is refused', () => {
+test('someone on no team is refused, with a clear message', () => {
   const { app } = setup();
+  as(app, 'stranger@example.com');
+  const r = app.ctx.apiBootstrap();
+  assert.equal(r.error.type, 'PermissionError');
+  assert.match(r.error.message, /not on a team/);
   as(app, '');
   assert.equal(app.ctx.apiBootstrap().error.type, 'PermissionError');
 });
 
-test('the last admin cannot be removed', () => {
+test('only managers can add or remove admins; admins can see the list', () => {
   const { app } = setup();
-  const r = app.ctx.apiAddListItem({ requestId: 'ad', list: 'Admins', value: 'admin@example.com' });
-  assert.equal(r.ok, true);
-  const res = app.ctx.apiRemoveListItem({ requestId: 'rm', list: 'Admins', id: r.data.item.id, version: r.data.item.version });
-  assert.equal(res.error.type, 'ValidationError');
+  as(app, 'admin@example.com');
+  assert.equal(app.ctx.apiAddListItem({ requestId: 'a1', list: 'Admins', value: 'new@example.com' }).error.type, 'PermissionError');
+  assert.ok(app.ctx.apiGetTeamSettings().data.Admins.some((a) => a.email === 'admin@example.com'));
+  as(app, 'pat@example.com');
+  const added = app.ctx.apiAddListItem({ requestId: 'a2', list: 'Admins', value: 'new@example.com' });
+  assert.equal(added.ok, true);
+  as(app, 'new@example.com');
+  assert.equal(app.ctx.apiBootstrap().data.role, 'admin');
+  as(app, 'pat@example.com');
+  assert.equal(app.ctx.apiRemoveListItem({ requestId: 'a3', list: 'Admins', id: added.data.item.id, version: added.data.item.version }).ok, true);
+  as(app, 'new@example.com');
+  assert.equal(app.ctx.apiBootstrap().error.type, 'PermissionError', 'removed admin loses access');
 });
 
 /* ───────────── Run lease ───────────── */
@@ -193,8 +210,8 @@ test('lease: two Run now clicks at once → exactly one run starts', () => {
   assert.equal(a.acquired, true);
   assert.equal(b.acquired, false);
   assert.equal(b.current.startedBy, 'a@example.com');
-  const run = app.g('Pipeline').run({ trigger: 'manual', triggeredBy: 'c@example.com' });
-  assert.equal(run.status, 'busy');
+  const run = app.g('Pipeline').run({ teamId: 'payments', trigger: 'manual', triggeredBy: 'kim@example.com' });
+  assert.equal(run.status, 'busy', 'one run at a time across the app, even for another team');
 });
 
 test('lease: an admin save during a run goes through immediately', () => {
@@ -244,17 +261,26 @@ test('triggers: runs at 6:00 and 13:00 on weekdays only, once per slot', () => {
   assert.equal(T.dueSlot(at('2026-11-17T16:00:00Z'), s, '2026-11-16 13:00', tz), '2026-11-17 06:00', 'missed 06:00 runs late, once');
 });
 
-test('triggers: a tick while a run is in progress retries on the next tick', () => {
+test('triggers: each team runs at its own times; a busy tick retries; a slot never runs twice', () => {
   const { app } = setup();
   const T = app.g('Triggers');
+  as(app, 'admin@example.com');
+  assert.equal(app.ctx.apiSaveTeamSetting({ requestId: 's1', key: 'RUN_DAYS', value: 'MON,TUE,WED,THU,FRI,SAT,SUN' }).ok, true);
+  assert.equal(app.ctx.apiSaveTeamSetting({ requestId: 's2', key: 'RUN_TIMES', value: '00:00' }).ok, true);
+  // payments keeps the default 06:00/13:00; 03:00 New York time means only billing is due
+  const early = new Date(Date.UTC(2026, 10, 17, 8, 0, 0));   // Tue 03:00 in New York
   app.g('Lease').acquire({ runId: 'other', startedBy: 'someone', trigger: 'manual' });
-  app.run("Config.settings = () => ({ RUN_TIMES: '00:00', RUN_DAYS: 'MON,TUE,WED,THU,FRI,SAT,SUN', RUN_NOW_COOLDOWN_MIN: 2, SUBJECT_MATCH_THRESHOLD: 0.75, SUBJECT_MIN_WORDS: 3, WRITEBACK_MAX_ATTEMPTS: 5, VERTEX_MIN_CONFIDENCE: 0.7 })");
-  assert.equal(T.tick(new Date()).status, 'busy');
-  assert.equal(app.mocks.props.get('last_run_slot'), undefined, 'slot not marked as done');
+  const busy = T.tick(early);
+  assert.equal(busy.runs[0].status, 'busy');
+  assert.equal(app.mocks.props.get('last_run_slot:billing'), undefined, 'slot not marked as done');
   app.g('Lease').release('other', false);
-  assert.equal(T.tick(new Date()).status, 'succeeded');
-  assert.ok(app.mocks.props.get('last_run_slot'));
-  assert.equal(T.tick(new Date()).status, 'idle', 'same slot never runs twice');
+  const ok = T.tick(early);
+  assert.equal(ok.runs.length, 1);
+  assert.equal(ok.runs[0].teamId, 'billing');
+  assert.equal(ok.runs[0].status, 'succeeded');
+  assert.ok(app.mocks.props.get('last_run_slot:billing'));
+  assert.equal(T.tick(early).status, 'idle', 'same slot never runs twice');
+  assert.equal(app.mocks.props.get('last_run_slot:payments'), undefined, 'payments was not due');
 });
 
 test('triggers: install keeps exactly one ticker', () => {
